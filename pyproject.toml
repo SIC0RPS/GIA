@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[project]
+name = "gia"
+version = "0.1.0"
+authors = [{name = "SICORPS"}]
+description = "LM Dev module, local LLM."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "chromadb>=0.5.20",
+    "gptqmodel @ git+https://github.com/ModelCloud/GPTQModel.git@main",
+    "gradio>=5.30.0",
+    "llama-index>=0.12.52",
+    "numpy>=2.3.2",
+    "torch>=2.7.1",
+    "transformers==4.51.2",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+]
+
+[project.urls]
+Homepage = "https://github.com/SIC0RPS/GIA"
+Repository = "https://github.com/SIC0RPS/GIA"
+
+[project.scripts]
+gia = "gia.__main__:main"
+
+[tool.black]
+line-length = 88
+target-version = ["py310", "py311", "py312", "py313"]
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+    \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''
+preview = true
+
+[tool.flake8]
+max-line-length = 88
+extend-ignore = "E203, E501, W503"
+exclude = [
+    ".git",
+    "__pycache__",
+    "*.pyc",
+    "*.egg-info",
+    ".cache",
+    ".eggs",
+    "conf",
+    "build",
+    "dist",
+    "migrations",
+    "venv",
+    ".venv",
+]
+per-file-ignores = "__init__.py:F401"
+max-complexity = 10
