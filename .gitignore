@@ -1,0 +1,209 @@
+# Environment variables and secrets
+.env
+*.env
+*.env.*
+*.secret
+*.key
+*.pem
+*.crt
+*.cert
+*.pfx
+*.p12
+secrets.yaml
+credentials.json
+config/secrets/
+# API keys or auth files
+*.token
+*.apikey
+auth/
+
+### MachineLearning ###
+# Experiments and Logs (prevent leaking experiment data or logs with sensitive info)
+experiments/
+logs/
+runs/
+wandb/
+lightning_logs/
+*.log
+*.err
+tensorboard/
+
+# Models and Checkpoints (large files; avoid committing trained models with embedded data)
+*.h5
+*.hdf5
+*.ckpt
+*.pth
+*.pt
+*.bin
+*.pkl
+*.joblib
+*.onnx
+*.pb
+*.tflite
+models/
+checkpoints/
+saved_models/
+model_artifacts/
+
+# Data (raw/processed; often contains PII or large datasets—keep local)
+data/
+datasets/
+*.csv
+*.tsv
+*.parquet
+*.feather
+*.arrow
+*.npy
+*.npz
+*.mat
+*.tfrecord
+*.tfrecords
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+# Project-specific data/temp dirs (ignore anywhere)
+**/tmp/
+**/temp/
+**/articles/
+**/db/
+**/downloads/
+**/extracted/
+
+# Notebooks (strip outputs to avoid sensitive data in cells)
+.ipynb_checkpoints/
+*.ipynb  # Optional: Ignore all notebooks if they contain secrets; otherwise, use nbconvert to strip before commit
+
+### Python ###
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Frameworks (Django, Flask, Scrapy)
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+instance/
+.webassets-cache
+.scrapy
+
+# Documentation
+docs/_build/
+**/site/  # mkdocs or similar
+
+# Builders/Linters/Type Checkers
+.pybuilder/
+target/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+cython_debug/
+
+# Environments (already covered, but reinforced)
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+__pypackages__/
+.pdm.toml
+.pdm-python
+.pdm-build/
+
+# Other Python Tools
+.spyderproject
+.spyproject
+.ropeproject
+.celerybeat-schedule
+celerybeat.pid
+*.sage.py
+.pytest_cache/
+
+### PyTorch ###
+# Datasets/Checkpoints/Logs (reinforced)
+*.pt
+*.pth
+logs/
+*.log
+
+### VisualStudioCode ###
+.vscode/
+
+# Local History (critical for security—prevents leaking old code versions with secrets)
+.history/
+.ionide
+*.code-workspace
+*.vsix
+
+### Project-Specific Additions
+# Private plugins (full dir to avoid any subfiles leaking)
+src/gia/plugins/
+
+# Unwanted/Sensitive Files
+.github/
+
+
+# Any other debug/temp files
+*.bak
+*.swp
+*.tmp
+Thumbs.db
+.DS_Store
+pip_constraints.txt
