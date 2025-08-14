@@ -1,6 +1,6 @@
 # **GIA: General Intelligence Assistant**
 
-GIA is a local-first, extensible AI assistant. It’s designed for people who want a smart chatbot that runs on their own hardware (if you can) its also possible to use openai and hugginfaces, xai api will be added soon, use it with your own data, and is easy to extend with plugins. This project is for developers, power users, and anyone who wants to use their own model or any .safetensors locally with your own documents. Quantized GPTQModel / [ModelCloud/GPTQModel](https://github.com/ModelCloud/GPTQModel). you can also build your own plugins easily.
+GIA is a local-first, extensible AI assistant. It’s designed for people who want a smart chatbot that runs on their own hardware (if you can) its also possible to use openai and hugginfaces, xai api will be added soon, use it with your own data, and is easy to extend with plugins. This project is for developers, power users, and anyone who wants to use their own model or any .safetensors locally with your own documents. Quantized [ModelCloud/GPTQModel](https://github.com/ModelCloud/GPTQModel). you can also build your own plugins easily.
 
 ## What is GIA?
 GIA is a Python application that combines large language models (LLMs), retrieval-augmented generation (RAG), and a plugin system. It supports both a command-line interface and a web UI (Gradio). All data and models stay on your machine unless you add a plugin that does otherwise.
