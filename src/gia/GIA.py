@@ -28,6 +28,7 @@ import torch
 import gradio as gr
 from functools import partial
 import shlex
+import requests
 
 # TODO auto generate_pyproject_toml
 # import atexit
@@ -386,6 +387,16 @@ def handle_command(
 
     # TO CHECK LLM INITIALIZATION FOR NON-LOAD COMMANDS
     if app_state.LLM is None and cmd_lower not in [".load", ".save", ".info", ".delete"]:
+        # Fallback: try to generate directly if LLM is available
+        if app_state.LLM is not None and cmd.strip():
+            result = generate(cmd, system_prefix(), app_state.LLM, max_new_tokens=1024) + "\n"
+            if is_gradio:
+                if is_chat_fn:
+                    yield "", chat_history, gr.State(state_dict)
+                else:
+                    yield chat_history, gr.State(state_dict)
+                return
+            return result
         error_msg = "Error: No model loaded. Please confirm a model first.\n"
         if is_gradio:
             if is_chat_fn:
@@ -598,206 +609,200 @@ def update_model_dropdown(directory: str) -> Tuple[gr.Dropdown, List[Dict[str, s
 
 ####
 
-def load_model_and_tokenizer(model_path: Optional[str] = None) -> Tuple[str, Any, Any]:
-    """Load model and tokenizer with state management.
-
-    Args:
-        model_path: Path to model directory.
-
-    Returns:
-        Message, loaded model, loaded tokenizer.
-    """
-    # TO LOAD STATE
-    app_state = load_state()
-    if not model_path:
-        msg = "No model folder selected yet! Cannot load model."
-        logger.warning(msg)
-        return msg, None, None
-
-    print(
-        f"GPU Memory Allocated Before Model Load: {torch.cuda.memory_allocated() / 1024**2:.2f} MB"
-    )
-    print(
-        f"GPU Memory Reserved Before Model Load: {torch.cuda.memory_reserved() / 1024**2:.2f} MB"
-    )
-
-    # TO CLEAR VRAM
-    clear_vram()
-    if (
-        app_state.MODEL is not None
-        and app_state.TOKENIZER is not None
-        and app_state.MODEL_PATH == model_path
-    ):
-        base = os.path.basename(app_state.MODEL_PATH)
-        print(f"Model already loaded: {base}")
-        return (
-            f"Model already loaded: {base}",
-            app_state.MODEL,
-            app_state.TOKENIZER,
-        )
-
+def fetch_openai_models() -> list:
+    """Fetch available OpenAI models from the API for dropdown choices, only valid chat/completion models."""
+    valid_models = [
+        "o1", "o1-2024-12-17", "o1-pro", "o1-pro-2025-03-19", "o1-preview", "o1-preview-2024-09-12", "o1-mini", "o1-mini-2024-09-12",
+        "o3-mini", "o3-mini-2025-01-31", "o3", "o3-2025-04-16", "o3-pro", "o3-pro-2025-06-10", "o4-mini", "o4-mini-2025-04-16",
+        "gpt-4", "gpt-4-32k", "gpt-4-1106-preview", "gpt-4-0125-preview", "gpt-4-turbo-preview", "gpt-4-vision-preview", "gpt-4-1106-vision-preview",
+        "gpt-4-turbo-2024-04-09", "gpt-4-turbo", "gpt-4o", "gpt-4o-audio-preview", "gpt-4o-audio-preview-2024-12-17", "gpt-4o-audio-preview-2024-10-01",
+        "gpt-4o-mini-audio-preview", "gpt-4o-mini-audio-preview-2024-12-17", "gpt-4o-2024-05-13", "gpt-4o-2024-08-06", "gpt-4o-2024-11-20",
+        "gpt-4.5-preview", "gpt-4.5-preview-2025-02-27", "chatgpt-4o-latest", "gpt-4o-mini", "gpt-4o-mini-2024-07-18", "gpt-4-0613",
+        "gpt-4-32k-0613", "gpt-4-0314", "gpt-4-32k-0314", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4.1-2025-04-14",
+        "gpt-4.1-mini-2025-04-14", "gpt-4.1-nano-2025-04-14", "gpt-3.5-turbo", "gpt-3.5-turbo-16k", "gpt-3.5-turbo-0125", "gpt-3.5-turbo-1106",
+        "gpt-3.5-turbo-0613", "gpt-3.5-turbo-16k-0613", "gpt-3.5-turbo-0301", "text-davinci-003", "text-davinci-002", "gpt-3.5-turbo-instruct",
+        "text-ada-001", "text-babbage-001", "text-curie-001", "ada", "babbage", "curie", "davinci", "gpt-35-turbo-16k", "gpt-35-turbo",
+        "gpt-35-turbo-0125", "gpt-35-turbo-1106", "gpt-35-turbo-0613", "gpt-35-turbo-16k-0613"
+    ]
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return valid_models
     try:
-        # TO LOAD MODEL
-        model = GPTQModel.load(model_path, device="cuda")
-        print("Model loaded successfully without explicit quantize_config")
-        tokenizer = model.tokenizer
-        print("Tokenizer loaded successfully")
-
-        # TO GATHER DYNAMIC INFO (RELIABLE PARAM COUNT FOR QUANTIZED & NON-QUANTIZED)
-        base_name = os.path.basename(model_path)
-        architecture = model.config.architectures[0] if hasattr(model.config, 'architectures') and model.config.architectures else "Unknown"
-        try:
-            param_count = sum(p.numel() for p in model.parameters()) / 1e9
-        except Exception:
-            param_count = "Unknown"
-        quant_bits = model.quantize_config.bits if hasattr(model, 'quantize_config') and model.quantize_config.bits else "Unknown"
-        msg = f"Loaded GPTQ model '{base_name}':\n- Architecture: {architecture}\n- Parameters: {param_count if isinstance(param_count, str) else f'{param_count:.2f}B'}\n- Quantization: {quant_bits}-bit"
-
-        text = "[END]"
-        ids = tokenizer.encode(text, add_special_tokens=False)
-        print(text, "→", ids, "tokens =", len(ids))
-        print("Decoded:", tokenizer.decode(ids))
-        print(
-            f"GPU Memory Allocated After Model Load: {torch.cuda.memory_allocated() / 1024**2:.2f} MB"
-        )
-        print(
-            f"GPU Memory Reserved After Model Load: {torch.cuda.memory_reserved() / 1024**2:.2f} MB"
-        )
-
-        # TO UPDATE STATE
-        state_manager.set_state("MODEL_PATH", model_path)
-        state_manager.set_state("MODEL", model)
-        state_manager.set_state("TOKENIZER", tokenizer)
-        return msg, model, tokenizer
-    except AttributeError as e:
-        error_msg = f"Failed to compute model details for '{os.path.basename(model_path)}': {str(e)}. Fallback to unknown."
-        logger.error(error_msg)
-        return error_msg, None, None
+        headers = {"Authorization": f"Bearer {api_key}"}
+        resp = requests.get("https://api.openai.com/v1/models", headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        # Only include valid models present in the API response
+        available = set(m["id"] for m in data.get("data", []))
+        filtered = [m for m in valid_models if m in available]
+        return filtered or valid_models
     except Exception as e:
-        error_msg = f"Failed to load model '{os.path.basename(model_path)}': {str(e)}"
-        logger.error(error_msg)
-        return error_msg, None, None
+        logger.warning(f"Could not fetch OpenAI models for dropdown: {e}")
+        return valid_models
 
-####
+def load_llm(mode: str, config: Dict[str, Any]) -> Tuple[str, Any]:
+    """Load LLM based on mode (local or online)."""
+    if mode == "Local":
+        clear_vram()
+    try:
+        if mode == "Local":
+            model_path = config.get("model_path")
+            if not model_path:
+                raise ValueError("Model path required for Local mode.")
+            model = GPTQModel.from_quantized(model_path, device_map=DEVICE_MAP)
+            tokenizer = model.tokenizer
+            shared_generate_kwargs = {
+                "temperature": TEMPERATURE,
+                "do_sample": True,
+                "top_k": TOP_K,
+                "top_p": TOP_P,
+                "min_p": 0.0,
+                "repetition_penalty": REPETITION_PENALTY,
+                "no_repeat_ngram_size": NO_REPEAT_NGRAM_SIZE,
+                "use_cache": True,
+                "eos_token_id": tokenizer.eos_token_id,
+            }
+            logits_processor = LogitsProcessorList([PresencePenaltyLogitsProcessor()])
+            try:
+                model.config.attn_implementation = "sdpa"
+                torch.backends.cuda.enable_mem_efficient_sdp(True)
+                model = torch.compile(
+                    model, mode="max-autotune", fullgraph=True
+                )
+                logger.info("Local model optimizations applied.")
+            except Exception as e:
+                logger.warning(f"Local optimizations skipped: {e}")
+            llm = HuggingFaceLLM(
+                model=model,
+                tokenizer=tokenizer,
+                context_window=CONTEXT_WINDOW,
+                max_new_tokens=MAX_NEW_TOKENS,
+                generate_kwargs={
+                    **shared_generate_kwargs,
+                    "logits_processor": logits_processor,
+                },
+                system_prompt=system_prefix(),
+                device_map=DEVICE_MAP,
+                model_name=model_path,
+                stopping_ids=[151643, 151645, 23483, 4689, 57208],
+            )
+            base_name = os.path.basename(model_path)
+            msg = f"Loaded local model: {base_name}"
+        elif mode == "HuggingFace Online":
+            token = os.getenv("HF_TOKEN")
+            if not token:
+                raise ValueError("HF_TOKEN not set in environment. Please set it via 'export HF_TOKEN=your_token' in your terminal.")
+            model_name = config.get("model_name")
+            if not model_name:
+                raise ValueError("Model name required for HuggingFace Online.")
+            llm = HuggingFaceInferenceAPI(
+                model_name=model_name,
+                token=token,
+                context_window=CONTEXT_WINDOW,
+                max_new_tokens=MAX_NEW_TOKENS,
+                temperature=TEMPERATURE,
+                do_sample=True,
+                top_k=TOP_K,
+                top_p=TOP_P,
+                repetition_penalty=REPETITION_PENALTY,
+            )
+            msg = f"Loaded HF Online model: {model_name}"
+        elif mode == "OpenAI":
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                raise ValueError("OPENAI_API_KEY not set in environment. Please set it via 'export OPENAI_API_KEY=sk-your_key' in your terminal.")
+            model_name = config.get("model_name")
+            if not model_name:
+                raise ValueError("Model name required for OpenAI.")
+            # Only pass supported parameters for each model family
+            # o1, o3, o4 do not support temperature/top_p, etc
+            if model_name.startswith("o1") or model_name.startswith("o3") or model_name.startswith("o4"):
+                llm = LlamaOpenAI(
+                    model=model_name,
+                    api_key=api_key
+                )
+            else:
+                llm = LlamaOpenAI(
+                    model=model_name,
+                    api_key=api_key,
+                    temperature=TEMPERATURE,
+                    max_tokens=MAX_NEW_TOKENS,
+                    additional_kwargs={"top_p": TOP_P},
+                )
+            msg = f"Loaded OpenAI model: {model_name}"
+        else:
+            raise ValueError(f"Invalid mode: {mode}")
+        return msg, llm
+    except Exception as e:
+        error_msg = f"Failed to load LLM in {mode} mode: {str(e)}"
+        logger.error(error_msg)
+        return error_msg, None
 
 def finalize_model_selection(
-    selected_folder: str, session_state: gr.State
+    selected_folder: str, session_state: gr.State, mode: str = "Local"
 ) -> Tuple[List[Dict[str, str]], gr.State, str]:
-    """Finalize model selection and update state.
-
-    Args:
-        selected_folder: Selected model folder.
-        session_state: Gradio state.
-
-    Returns:
-        Chat history, updated state, display message.
-    """
-    # STEP 1: ENABLE TF32 EARLY FOR FASTER MATMULS (BEFORE MODEL OPS)
     torch.set_float32_matmul_precision('high')
-
-    # STEP 2: LOAD STATE AND VALIDATE INPUTS
     app_state = load_state()
-    state_dict = (
-        session_state.value if isinstance(session_state, gr.State) else session_state
-    )
+    state_dict = session_state.value if isinstance(session_state, gr.State) else {}
     if not isinstance(state_dict, dict):
-        state_dict = {"use_query_engine_gr": True, "status_gr": ""}
-
-    if not selected_folder:
+        state_dict = {"use_query_engine_gr": True, "status_gr": "", "mode": "Local"}
+    state_dict["mode"] = mode
+    state_manager.set_state("MODE", mode)
+    logger.info(f"Model mode set to {mode} globally.")
+    # Only require folder for Local mode
+    if mode == "Local":
+        if not selected_folder:
+            return (
+                [{"role": "assistant", "content": "No folder selected!"}],
+                gr.State(state_dict),
+                "Model: Selection Failed",
+            )
+        state_dict["model_path_gr"] = selected_folder
+        if app_state.MODEL_PATH == selected_folder:
+            base = os.path.basename(selected_folder)
+            return (
+                [
+                    {
+                        "role": "assistant",
+                        "content": f"Model unchanged: {base}",
+                    }
+                ],
+                gr.State(state_dict),
+                f"Model: {base}",
+            )
+        config = {"model_path": selected_folder}
+    elif mode == "HuggingFace Online":
+        model_name = state_dict.get("hf_model_name", "deepseek-ai/DeepSeek-R1")
+        config = {"model_name": model_name}
+        state_dict["model_path_gr"] = None
+    elif mode == "OpenAI":
+        # Use fetch_openai_models for latest models
+        available_models = fetch_openai_models()
+        default_model = available_models[0] if available_models else "gpt-4o"
+        model_name = state_dict.get("openai_model_name", default_model)
+        config = {"model_name": model_name}
+        state_dict["model_path_gr"] = None
+    else:
         return (
-            [{"role": "assistant", "content": "No folder selected!"}],
+            [{"role": "assistant", "content": f"Unknown mode: {mode}"}],
             gr.State(state_dict),
             "Model: Selection Failed",
         )
-
-    state_dict["model_path_gr"] = selected_folder
-
-    if app_state.MODEL_PATH == selected_folder:
-        base = os.path.basename(selected_folder)
+    msg, llm = load_llm(mode, config)
+    if llm is None:
         return (
-            [
-                {
-                    "role": "assistant",
-                    "content": f"Model unchanged: {base}",
-                }
-            ],
+            [{"role": "assistant", "content": f"Failed to load: {msg}"}],
             gr.State(state_dict),
-            f"Model: {base}",
+            "Model: Load Failed",
         )
-
-    # STEP 3: MAP GRADIO STATE TO GLOBAL STATE
-    state_manager.set_state("MODEL_PATH", selected_folder)
-    base = os.path.basename(selected_folder)
-    msg, loaded_model, loaded_tokenizer = load_model_and_tokenizer(selected_folder)
-    if loaded_model is None or loaded_tokenizer is None:
-        return (
-            [{"role": "assistant", "content": f"Failed to load model: {msg}"}],
-            gr.State(state_dict),
-            f"Model: Load Failed ({base})",
-        )
-
-    # STEP 4: DEFINE SHARED GENERATE KWARGS
-    shared_generate_kwargs = {
-        "temperature": TEMPERATURE,
-        "do_sample": True,
-        "top_k": TOP_K,
-        "top_p": TOP_P,
-        "min_p": 0.0,
-        "repetition_penalty": REPETITION_PENALTY,
-        "no_repeat_ngram_size": NO_REPEAT_NGRAM_SIZE,
-        "use_cache": True,
-        "eos_token_id": loaded_tokenizer.eos_token_id,
-    }
-
-    # STEP 5: CREATE LOGITS PROCESSOR
-    logits_processor = LogitsProcessorList([PresencePenaltyLogitsProcessor()])
-
-    try:
-        # STEP 6: CONFIGURE SDPA (FUSED FOR EFFICIENCY IN QUANTIZED)
-        loaded_model.config.attn_implementation = "sdpa"
-        # STEP 7: ENABLE MEM EFFICIENT SDP (REDUCES VRAM IN ATTENTION)
-        torch.backends.cuda.enable_mem_efficient_sdp(True)
-        # STEP 8: COMPILE MODEL (AUTOTUNES KERNELS FOR TPS)
-        loaded_model = torch.compile(
-            loaded_model, mode="max-autotune", fullgraph=True
-        )
-        logger.info("SDPA, mem_efficient, and torch.compile enabled successfully.")
-    except Exception as e:
-        logger.warning(f"Optimization failed: {e}—using default model.")
-
-    # STEP 9: INITIALIZE LLM WITH ERROR HANDLING
-    try:
-        llm = HuggingFaceLLM(
-            model=loaded_model,
-            tokenizer=loaded_tokenizer,
-            context_window=CONTEXT_WINDOW,
-            max_new_tokens=MAX_NEW_TOKENS,
-            generate_kwargs={
-                **shared_generate_kwargs,
-                "logits_processor": logits_processor,
-            },
-            system_prompt=system_prefix(),
-            device_map="cuda",
-            model_name=selected_folder,
-            stopping_ids=[151643, 151645, 23483, 4689, 57208],
-        )
-    except ValueError as ve:
-        raise ValueError(f"LLM init failed: {ve}")
-
     Settings.llm = llm
     state_manager.set_state("LLM", llm)
-    state_manager.set_state("MODEL_NAME", base)
-    state_dict["model_name_gr"] = base
-
+    state_dict["model_name_gr"] = msg.split(": ")[-1] if ": " in msg else "Unknown"
+    logger.info(f"Loaded LLM type: {type(llm).__name__} for mode {mode}.")
     return (
-        [
-            {
-                "role": "assistant",
-                "content": msg,  # Use detailed msg without paths
-            }
-        ],
+        [{"role": "assistant", "content": msg}],
         gr.State(state_dict),
-        f"Model: {base}",
+        f"Model: {state_dict['model_name_gr']}",
     )
 
 ####
@@ -860,40 +865,31 @@ def handle_load_button(state: gr.State) -> Tuple[List[Dict[str, str]], gr.State]
             "model_path_gr": None,
             "database_loaded_gr": False,
         }
-
-    # TO CHECK IF ALREADY LOADED AND RETURN EARLY WITH MESSAGE
     if state_dict.get("database_loaded_gr", False):
         message = "Database already loaded."
         if not chat_history or chat_history[-1].get("content") != message:
             append_to_chatbot(chat_history, message, metadata={"role": "assistant"})
         return chat_history, gr.State(state_dict)
-
     model_path_gr = state_dict.get("model_path_gr")
-    if not model_path_gr:
-        message = "Error: Model path is not specified in the state."
-        append_to_chatbot(chat_history, message, metadata={"role": "assistant"})
-        return chat_history, gr.State(state_dict)
-
+    # For online modes, model_path_gr may be None, but database can still be loaded
     try:
-        # OPTIMIZED CHECK: SKIP IF LLM ALREADY LOADED
-        if app_state.LLM is not None and app_state.MODEL_PATH == model_path_gr:
+        if app_state.LLM is not None and (app_state.MODEL_PATH == model_path_gr or model_path_gr is None):
             logger.info("(LOAD) LLM already loaded, skipping reload")
         else:
-            logger.info(
-                f"(LOAD) Loading model from {model_path_gr} as LLM is None or path mismatch"
-            )
-            msg, loaded_model, loaded_tokenizer = load_model_and_tokenizer(model_path_gr)
-            if loaded_model is None:
+            logger.info(f"(LOAD) Loading model from {model_path_gr} as LLM is None or path mismatch")
+            # Use mode from state_dict
+            mode = state_dict.get("mode", "Local")
+            config = {"model_path": model_path_gr} if mode == "Local" else {}
+            msg, llm = load_llm(mode, config)
+            if llm is None:
                 message = f"Error: Failed to load model: {msg}"
                 append_to_chatbot(chat_history, message, metadata={"role": "assistant"})
                 return chat_history, gr.State(state_dict)
-
-        # TO PROCESS LOAD COMMAND
+            state_manager.set_state("LLM", llm)
         result = load_database_wrapper(state_dict)
         message = str(result).strip()
         if message and (not chat_history or chat_history[-1].get("content") != message):
             append_to_chatbot(chat_history, message, metadata={"role": "assistant"})
-
         state_dict["use_query_engine_gr"] = True
         state_dict["status_gr"] = "Database loaded"
         state_dict["database_loaded_gr"] = True
@@ -950,7 +946,6 @@ from functools import partial
 
 def launch_app() -> None:
     """Launch Gradio application."""
-    # TO CONFIGURE GRADIO
     with gr.Blocks(
         title="SCRPS AI",
         delete_cache=(60, 60),
@@ -967,17 +962,54 @@ def launch_app() -> None:
                 "status_gr": "",
                 "model_name_gr": "Unknown Model",
                 "model_path_gr": None,
+                "mode": "Local",
+                "hf_model_name": "meta-llama/Llama-2-7b-chat-hf",
+                "openai_model_name": "gpt-3.5-turbo",
             }
         )
         chatbot = gr.Chatbot(type="messages", value=[], height=777)
         msg = gr.Textbox(placeholder="Enter your message or command (e.g., .gen)")
         submit_btn = gr.Button("Submit")
-        with gr.Row():
+
+        # Add mode selection radio
+        mode_radio = gr.Radio(
+            choices=["Local", "HuggingFace Online", "OpenAI"],
+            value="Local",
+            label="Model Mode"
+        )
+        # Warning markdown for API keys
+        warning_md = gr.Markdown("", visible=False)
+
+        # Local UI (visible only in Local mode)
+        with gr.Row(visible=True) as local_row:
             models_dir_input = gr.Textbox(label="Models Directory", value=MODEL_PATH)
             folder_dropdown = gr.Dropdown(choices=[], label="Select a Model")
-        with gr.Row():
             scan_dir_button = gr.Button("Scan Directory")
-            confirm_model_button = gr.Button("Confirm Model")
+
+        # HF Online UI (hidden initially)
+        with gr.Row(visible=False) as hf_row:
+            hf_model_dropdown = gr.Dropdown(
+                choices=[
+                    "deepseek-ai/DeepSeek-R1",
+                    "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                    "meta-llama/Llama-2-7b-chat-hf",
+                    "mistralai/Mistral-7B-Instruct-v0.1",
+                    "google/gemma-7b-it",
+                    "Qwen/Qwen3-8B",
+                ],
+                label="HF Model",
+                value="deepseek-ai/DeepSeek-R1",
+            )
+
+        # OpenAI UI (hidden initially)
+        with gr.Row(visible=False) as openai_row:
+            openai_model_dropdown = gr.Dropdown(
+                choices=fetch_openai_models(),
+                label="OpenAI Model",
+                value="gpt-4o",
+            )
+
+        confirm_model_button = gr.Button("Confirm Model")
         with gr.Row():
             load_button = gr.Button("Load Database")
         # PLUGIN GROUPING IN ACCORDION WITH ROW
@@ -988,22 +1020,11 @@ def launch_app() -> None:
                 else:
                     for plugin_name in plugins.keys():
                         btn = gr.Button(value=plugin_name.capitalize())
-                        # BIND CLICK TO SIMPLE HANDLER
                         def plugin_handler_simple(
                             name: str,
                             chat_history: List[Dict[str, str]],
                             state: gr.State
                         ) -> Generator[Tuple[List[Dict[str, str]], gr.State], None, None]:
-                            """Simple handler for plugin execution without state changes.
-
-                            Args:
-                                name: Plugin name.
-                                chat_history: Chat history.
-                                state: Gradio state.
-
-                            Yields:
-                                Updated chat history, state.
-                            """
                             try:
                                 handler_gen = handle_command(
                                     f".{name}",
@@ -1021,22 +1042,75 @@ def launch_app() -> None:
                             except Exception as e:
                                 logger.error(f"Plugin {name} error: {e}")
                                 yield chat_history, state
-
                         btn.click(
                             fn=partial(plugin_handler_simple, plugin_name),
                             inputs=[chatbot, session_state],
                             outputs=[chatbot, session_state],
                             queue=True,
                         )
-        # TO BIND BUTTON ACTIONS (EXISTING)
+        # UI logic for mode switching
+        def update_mode_visibility(selected_mode: str, state):
+            # Robustly handle both gr.State and dict
+            if hasattr(state, 'value'):
+                state_dict = state.value
+            else:
+                state_dict = state
+            if not isinstance(state_dict, dict):
+                state_dict = {"mode": selected_mode}
+            state_dict["mode"] = selected_mode
+            warning_value = ""
+            warning_visible = False
+            if selected_mode == "HuggingFace Online":
+                if not os.getenv("HF_TOKEN"):
+                    warning_value = "HF_TOKEN not detected. Please set it in your environment: `export HF_TOKEN=your_token_here` in your terminal and restart the app."
+                    warning_visible = True
+            elif selected_mode == "OpenAI":
+                if not os.getenv("OPENAI_API_KEY"):
+                    warning_value = "OPENAI_API_KEY not detected. Please set it in your environment: `export OPENAI_API_KEY=sk-your_key_here` in your terminal and restart the app."
+                    warning_visible = True
+            return (
+                gr.update(visible=selected_mode == "Local"),
+                gr.update(visible=selected_mode == "HuggingFace Online"),
+                gr.update(visible=selected_mode == "OpenAI"),
+                gr.update(value=warning_value, visible=warning_visible),
+                gr.State(state_dict),
+            )
+        mode_radio.change(
+            fn=update_mode_visibility,
+            inputs=[mode_radio, session_state],
+            outputs=[local_row, hf_row, openai_row, warning_md, session_state],
+        )
+        hf_model_dropdown.change(
+            lambda model, state: (state.value.update({"hf_model_name": model}) or state) if hasattr(state, 'value') else (state.update({"hf_model_name": model}) or state),
+            inputs=[hf_model_dropdown, session_state],
+            outputs=[session_state],
+        )
+        openai_model_dropdown.change(
+            lambda model, state: (state.value.update({"openai_model_name": model}) or state) if hasattr(state, 'value') else (state.update({"openai_model_name": model}) or state),
+            inputs=[openai_model_dropdown, session_state],
+            outputs=[session_state],
+        )
         scan_dir_button.click(
             fn=update_model_dropdown,
             inputs=[models_dir_input],
             outputs=[folder_dropdown, chatbot],
         )
+        def confirm_model_handler(selected_folder, state, mode, hf_model, openai_model):
+            if hasattr(state, 'value'):
+                state_dict = state.value
+            else:
+                state_dict = state
+            if mode == "HuggingFace Online":
+                state_dict["hf_model_name"] = hf_model
+                return finalize_model_selection(selected_folder, gr.State(state_dict), mode)
+            elif mode == "OpenAI":
+                state_dict["openai_model_name"] = openai_model
+                return finalize_model_selection(selected_folder, gr.State(state_dict), mode)
+            else:
+                return finalize_model_selection(selected_folder, gr.State(state_dict), mode)
         confirm_model_button.click(
-            fn=finalize_model_selection,
-            inputs=[folder_dropdown, session_state],
+            fn=confirm_model_handler,
+            inputs=[folder_dropdown, session_state, mode_radio, hf_model_dropdown, openai_model_dropdown],
             outputs=[chatbot, session_state, model_name_display],
         )
         load_button.click(
@@ -1050,7 +1124,6 @@ def launch_app() -> None:
             outputs=[msg, chatbot, session_state],
             queue=True,
         )
-    # TO LAUNCH APP
     demo.launch(server_name="0.0.0.0", server_port=7860, show_error=True, debug=True)
 
 ####
@@ -1073,26 +1146,21 @@ def load_database_wrapper(state: Dict) -> str:
     if state is None or not isinstance(state, dict):
         raise ValueError("Invalid state: expected dictionary.")
 
-    # USE '_gr' SUFFIX FOR GRADIO STATE
+    # Only allow database load for Local mode
     model_path_gr = state.get("model_path_gr")
-    if not model_path_gr:
-        raise ValueError("No model path specified in state.")
-
+    # For online modes, model_path_gr may be None
     if state_manager.get_state("DATABASE_LOADED"):
         return "Database already loaded.\n"
-
-    # TO ENSURE LLM IS LOADED WITH TRY/EXCEPT
     try:
         if app_state.LLM is None:
-            msg, loaded_model, loaded_tokenizer = load_model_and_tokenizer(
-                model_path_gr
-            )
-            if app_state.LLM is None:
+            mode = state.get("mode", "Local")
+            config = {"model_path": model_path_gr} if mode == "Local" else {}
+            msg, llm = load_llm(mode, config)
+            if llm is None:
                 raise RuntimeError(f"Failed to load model: {msg}")
+            state_manager.set_state("LLM", llm)
     except Exception as e:
         raise RuntimeError(f"Model load error during database wrapper: {str(e)}") from e
-
-    # TO LOAD DATABASE EXPLICITLY
     return load_database(app_state.LLM)
 
 
@@ -1145,3 +1213,4 @@ if __name__ == "__main__":
         traceback.print_exc()
     finally:
         cleanup()
+
