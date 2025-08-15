@@ -1,9 +1,10 @@
 # **GIA: General Intelligence Assistant**
 
-GIA is a local-first, extensible AI assistant. It’s designed for people who want a smart chatbot that runs on their own hardware (if you can) its also possible to use openai and hugginfaces, xai api will be added soon, use it with your own data, and is easy to extend with plugins. This project is for developers, power users, and anyone who wants to use their own model or any .safetensors locally with your own documents. Quantized [ModelCloud/GPTQModel](https://github.com/ModelCloud/GPTQModel). you can also build your own plugins easily.
+GIA is a local first extensible AI assistant and not just another wrapper but a platform for anyone to experiment with AI. It can run on your own hardware or connect to OpenAI, HuggingFace, and soon XAI APIs. It works with your own data, supports local models including any .safetensors, and can run quantized GPTQ models for faster performance. Built for developers, power users, and anyone who wants full control. Plugins are simple to create.
+
 
 ## What is GIA?
-GIA is a Python application that combines large language models (LLMs), retrieval-augmented generation (RAG), and a plugin system. It supports both a command-line interface and a web UI (Gradio). All data and models stay on your machine unless you add a plugin that does otherwise.
+GIA is a Python application that combines large language models (LLMs), retrieval-augmented generation (RAG), and a plugin system. It supports both a command-line interface and a web UI (Gradio).
 
 ## Features
 - Local LLM inference (no cloud required)
@@ -11,6 +12,8 @@ GIA is a Python application that combines large language models (LLMs), retrieva
 - Plugin system: add new features by dropping in a Python file
 - CLI and web UI, always in sync
 - Efficient resource management for long-running use
+- HuggingFace Online: enter any valid model name manually or select from dropdown
+- OpenAI: dynamic dropdown of valid models from API (no manual entry)
 
 ## Quick Start
 
@@ -43,59 +46,69 @@ GIA is a Python application that combines large language models (LLMs), retrieva
 1. Enter the path where your models (LLM and embedding model) are located in the UI.
 2. Scan the directory to list available models.
 3. Confirm model selection. No manual config or coding required.
-4. Create a database with one click (“Create Database”).  
+4. For HuggingFace Online: you can enter any valid model name manually or pick from the dropdown.
+5. For OpenAI: select from the dynamic dropdown (models are fetched from the API).
+6. Create a database with one click (“Create Database”).  
    _Tip: After creating the database, close and restart GIA for best results._
-5. Next time you start GIA, load your chosen model and then load the database to use the query engine.
-6. Loaded plugins will show at the bottom of the Gradio UI. You can launch plugins by clicking their name.
+7. Next time you start GIA, load your chosen model and then load the database to use the query engine.
+8. If database is not loaded, LLM will still answer directly (no retrieval).
+9. Loaded plugins will show at the bottom of the Gradio UI. You can launch plugins by clicking their name.
 
 
 ## Creating Plugins
 
-You can add new features to GIA by writing a plugin. Here’s how:
+Add new features by writing a plugin. Anyone can do it:
 
-1. Create a folder for your plugin, e.g.:
+1. Create a folder for your plugin:
    ```bash
-   mkdir -p src/gia/plugins/myplugin/
+   mkdir -p src/gia/plugins/my_plugins/
    ```
-2. Add a Python file named after your plugin, e.g.:
+2. Add a Python file with the same name:
    ```bash
-   touch src/gia/plugins/myplugin/myplugin.py
+   touch src/gia/plugins/my_plugins/my_plugins.py
    ```
-3. Define a function with the same name as your plugin folder. The function signature should be:
+3. Define a function with the same name as the folder/file:
    ```python
-   def myplugin(llm, query_engine, embed_model, chat_history, arg=None):
-       ...
+   def my_plugins(llm, query_engine, embed_model, chat_history, arg=None):
+       yield "Plugin started."
+       # Your logic here
    ```
-   - `llm`: The loaded language model instance.
-   - `query_engine`: The retrieval/query engine (if available).
-   - `embed_model`: The embedding model instance.
-   - `chat_history`: List of previous chat messages.
-   - `arg`: (Optional) Any argument passed from the UI/CLI.
-   - The function should yield strings to send messages to the UI/CLI.
 
-**Example Plugin:**
+**How plugins work:**
+- Function name must match folder and file name.
+- Arguments:
+  - `llm`: Loaded language model instance
+  - `query_engine`: Retrieval/query engine (if available)
+  - `embed_model`: Embedding model instance
+  - `chat_history`: List of previous chat messages
+  - `arg`: (Optional) Argument from UI/CLI
+- Yield strings to send output to UI/CLI (can yield multiple times for streaming)
+- Plugins are hot-reloaded, edit and rerun, no restart needed
+- Only load trusted code (plugins run as Python)
+
+**Minimal working example:**
 ```python
-from gia.core.logger import logger, log_banner
+def my_plugins(llm, query_engine, embed_model, chat_history, arg=None):
+    if arg:
+        yield f"You passed: {arg}"
+    else:
+        yield "No argument provided."
+```
+
+**Example with LLM call:**
+```python
 from gia.core import generate
 
-log_banner(__file__)
-
-def myplugin(llm, query_engine, embed_model, chat_history, arg=None):
-    yield "MyPlugin started."
-    try:
-        prompt = "What's the weather like on Mars?"
-        system_prompt = "You are a helpful assistant."
-        response = generate(prompt, system_prompt, llm, max_new_tokens=256)
-        yield f"LLM says: {response}"
-    except Exception as e:
-        logger.error(f"Error in myplugin: {e}")
-        yield f"Error: {str(e)}"
+def my_plugins(llm, query_engine, embed_model, chat_history, arg=None):
+    prompt = arg or "Say hello."
+    system_prompt = "You are a helpful assistant."
+    response = generate(prompt, system_prompt, llm, max_new_tokens=128)
+    yield f"LLM says: {response}"
 ```
-- Edit your plugin file and GIA will pick up changes automatically.
-- Only load plugins you trust. Plugins run as Python code and have access to your system.
 
-This is a personal project, but suggestions and bug reports are welcome. If you have an idea or find a problem, open an issue.
+- Edit your plugin file and GIA will pick up changes automatically.
+- Plugins run in their own threads; errors do not crash the main app.
 
 ---
 
-For more details, see the code and comments. If you get stuck, just ask.
+For more details, see the code and comments.
