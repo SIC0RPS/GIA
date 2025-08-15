@@ -207,3 +207,7 @@ src/gia/plugins/
 Thumbs.db
 .DS_Store
 pip_constraints.txt
+
+# Allow the db folder but ignore its contents
+!/db/
+db/*
