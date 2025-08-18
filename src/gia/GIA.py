@@ -2,9 +2,7 @@
 import sys
 import os
 import importlib
-import pickle
 import threading
-import time
 import inspect
 import json
 import logging
@@ -12,6 +10,9 @@ import gc
 import hashlib
 import queue
 import traceback
+import argparse
+import time
+from functools import partial
 from datetime import datetime
 from pathlib import Path
 from colorama import Style, Fore
@@ -21,7 +22,6 @@ from typing import Dict, Callable, List, Generator, Optional, Tuple, Any, Union
 from gptqmodel import GPTQModel
 from llama_index.llms.huggingface import HuggingFaceLLM
 from llama_index.llms.openai import OpenAI as LlamaOpenAI
-from llama_index.llms.huggingface import HuggingFaceLLM
 from llama_index.llms.huggingface_api import HuggingFaceInferenceAPI
 from llama_index.core import Settings
 import torch
@@ -41,25 +41,42 @@ import requests
 from gia.core.logger import logger
 from gia.core.utils import append_to_chatbot
 from gia.core.logger import logger, log_banner
-from gia.config import CONFIG, PROJECT_ROOT
 from gia.core.state import state_manager
 from gia.core.state import load_state
 from gia.core.utils import (
     generate,
-    update_database,
     clear_vram,
     save_database,
     load_database,
     get_system_info,
     append_to_chatbot,
-    LogitsProcessor,
-    LogitsProcessorList,
-    PresencePenaltyLogitsProcessor
+    unload_model,
+    load_llm,
+    fetch_openai_models,
 )
-
+from gia.core.logger import logger, log_banner
 log_banner(__file__)
 
-sys.path.insert(0, str(PROJECT_ROOT))
+from gia.config import CONFIG, PROJECT_ROOT
+
+# CONFIG VALUES FOR DIRECT USE
+RULES_PATH = CONFIG["RULES_PATH"]
+CONTEXT_WINDOW = CONFIG["CONTEXT_WINDOW"]
+MAX_NEW_TOKENS = CONFIG["MAX_NEW_TOKENS"]
+TEMPERATURE = CONFIG["TEMPERATURE"]
+TOP_P = CONFIG["TOP_P"]
+TOP_K = CONFIG["TOP_K"]
+REPETITION_PENALTY = CONFIG["REPETITION_PENALTY"]
+NO_REPEAT_NGRAM_SIZE = CONFIG["NO_REPEAT_NGRAM_SIZE"]
+MODEL_PATH = CONFIG["MODEL_PATH"]
+EMBED_MODEL_PATH = CONFIG["EMBED_MODEL_PATH"]
+DB_PATH = CONFIG["DB_PATH"]
+DEBUG = CONFIG["DEBUG"]
+DEVICE_MAP = "cuda" if torch.cuda.is_available() else "cpu"
+# Global chat_history and message queue
+chat_history = []
+
+
 
 class PluginSandbox:
     """Isolated sandbox for plugin execution using threading with cooperative stop.
@@ -89,12 +106,12 @@ class PluginSandbox:
         self.thread: Optional[threading.Thread] = None
         self.output_queue: Queue = Queue()  # FOR RESULTS/STREAMING
         self.input_queue: Queue = Queue()  # FOR COMMANDS FROM MAIN (E.G., STOP)
-        self.logging_queue: Queue = Queue()  # FOR LOGS
+        self.logger_queue: Queue = Queue()  # FOR LOGS
         self.stop_event = threading.Event()  # FOR COOPERATIVE STOP
         self.listener: Optional[QueueListener] = None
 
     def start(self) -> None:
-        """Start the sandbox thread and logging listener.
+        """Start the sandbox thread and logger listener.
 
         TO CREATE THREAD WITH STOP EVENT AND START DAEMON.
         """
@@ -107,17 +124,37 @@ class PluginSandbox:
                 self.kwargs,
                 self.output_queue,
                 self.input_queue,
-                self.logging_queue,
+                self.logger_queue,
                 self.stop_event,
             ),
         )
         self.thread.daemon = True
         self.thread.start()
 
-        # TO CONFIGURE LOGGING HANDLERS - TERMINAL ONLY
-        handlers = [logging.StreamHandler(sys.stdout)]
-        self.listener = QueueListener(self.logging_queue, *handlers)
+        # TO CONFIGURE logger HANDLERS - TERMINAL ONLY
+        handlers = [logger.StreamHandler(sys.stdout)]
+        self.listener = QueueListener(self.logger_queue, *handlers)
         self.listener.start()
+
+    def stop(self) -> None:
+        """Stop the sandbox thread cooperatively and clean up resources.
+
+        TO SIGNAL STOP VIA EVENT AND QUEUE, JOIN WITH TIMEOUT, AND STOP LISTENER.
+        """
+        # TO SET STOP SIGNAL FOR COOPERATIVE EXIT
+        self.stop_event.set()
+        self.input_queue.put("stop")
+
+        # TO WAIT FOR THREAD COMPLETION WITH TIMEOUT TO AVOID HANGS
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=5.0)  # 5-SECOND TIMEOUT FOR GRACEFUL SHUTDOWN
+            if self.thread.is_alive():
+                logger.warning(f"Timeout waiting for plugin '{self.plugin_name}' thread to stop.")
+
+        # TO STOP logger LISTENER AND CLEAN UP
+        if self.listener:
+            self.listener.stop()
+            self.listener = None
 
     @staticmethod
     def _run_func(
@@ -126,10 +163,10 @@ class PluginSandbox:
         kwargs: Dict,
         output_queue: Queue,
         input_queue: Queue,
-        logging_queue: Queue,
+        logger_queue: Queue,
         stop_event: threading.Event,
     ) -> None:
-        """Target function for the thread: execute plugin with logging and stop check.
+        """Target function for the thread: execute plugin with logger and stop check.
 
         Args:
             func: Plugin function.
@@ -137,29 +174,29 @@ class PluginSandbox:
             kwargs: Keyword args.
             output_queue: Queue for results/streaming.
             input_queue: Queue for commands from main.
-            logging_queue: Queue for logs.
+            logger_queue: Queue for logs.
             stop_event: Event to check for stop signal.
         """
-        # TO SET UP LOGGING IN CHILD THREAD
-        root_logger = logging.getLogger()
-        queue_handler = QueueHandler(logging_queue)
+        # TO SET UP logger IN CHILD THREAD
+        root_logger = logger.getLogger()
+        queue_handler = QueueHandler(logger_queue)
         root_logger.addHandler(queue_handler)
 
         try:
             # DEBUG PRINT TO CONFIRM THREAD START
-            logging.debug("Plugin thread started; executing function.")
+            logger.debug("Plugin thread started; executing function.")
             # TO EXECUTE PLUGIN FUNCTION
             result = func(*args, **kwargs)
             if inspect.isgenerator(result):
                 # TO HANDLE GENERATOR WITH BIDIRECTIONAL CHECKS AND STOP EVENT
                 for chunk in result:
                     if stop_event.is_set():
-                        logging.info("Plugin stopped by event")
+                        logger.info("Plugin stopped by event")
                         break
                     try:
                         cmd = input_queue.get_nowait()
                         if cmd == "stop":
-                            logging.info("Plugin stopped by command")
+                            logger.info("Plugin stopped by command")
                             break
                     except Empty:
                         pass
@@ -167,7 +204,7 @@ class PluginSandbox:
             else:
                 # TO HANDLE NON-GENERATOR RESULT
                 if stop_event.is_set():
-                    logging.info("Plugin stopped by event")
+                    logger.info("Plugin stopped by event")
                 else:
                     output_queue.put(result)
             output_queue.put(None)  # SENTINEL FOR END
@@ -176,13 +213,13 @@ class PluginSandbox:
             output_queue.put(exc)
             output_queue.put(None)
         except Exception as e:
-            logging.error(f"Error in plugin resumption: {e}")
+            logger.error(f"Error in plugin resumption: {e}")
             output_queue.put(e)
             output_queue.put(None)
 
 plugins: Dict[str, Callable] = {}
 module_mtimes: Dict[str, float] = {}
-plugins_dir_path: Path = PROJECT_ROOT / "gia" / "plugins"
+plugins_dir_path: Path = PROJECT_ROOT / "plugins"
 active_sandboxes: Dict[str, PluginSandbox] = {}
 sandboxes_lock = threading.Lock()
 
@@ -230,69 +267,72 @@ def load_plugins() -> Dict[str, Callable]:
 plugins = load_plugins()
 logger.info(f"(L.P) Loaded {len(plugins)} plugins: {list(plugins.keys())}")
 
-# CONFIG VALUES FOR DIRECT USE
-RULES_PATH = CONFIG["RULES_PATH"]
-CONTEXT_WINDOW = CONFIG["CONTEXT_WINDOW"]
-MAX_NEW_TOKENS = CONFIG["MAX_NEW_TOKENS"]
-TEMPERATURE = CONFIG["TEMPERATURE"]
-TOP_P = CONFIG["TOP_P"]
-TOP_K = CONFIG["TOP_K"]
-REPETITION_PENALTY = CONFIG["REPETITION_PENALTY"]
-NO_REPEAT_NGRAM_SIZE = CONFIG["NO_REPEAT_NGRAM_SIZE"]
-MODEL_PATH = CONFIG["MODEL_PATH"]
-EMBED_MODEL_PATH = CONFIG["EMBED_MODEL_PATH"]
-DB_PATH = CONFIG["DB_PATH"]
-DEBUG = CONFIG["DEBUG"]
-DEVICE_MAP = "cuda" if torch.cuda.is_available() else "cpu"
-# Global chat_history and message queue
-chat_history = []
-
 ####
 
 
-# SYSTEM PROMPT - FOR CONSISTENT PROMPT LOADING
 def system_prefix() -> str:
-    """Load system prompt from rules file.
-
-    Returns:
-        str: System prompt string.
-    """
-    # TO LOAD AND PARSE RULES
-    with open(RULES_PATH, "r") as f:
-        rules = json.load(f)
-    return "\n".join(rules["system_prompt"])
+    """Load system prompt from config or rules file, handling all edge cases."""
+    # TO DEFINE DEFAULT PROMPT AS FALLBACK
+    default_prompt = "You are an expert. Provide accurate, reliable, and evidence-based assistance to solve user queries effectively."
+    try:
+        # TO RETRIEVE SYSTEM_PROMPT FROM CONFIG IF DEFINED
+        system_prompt = CONFIG.get("SYSTEM_PROMPT", None)
+        # TO EARLY RETURN DEFAULT IF NEITHER SYSTEM_PROMPT NOR RULES_PATH IS SET
+        if not system_prompt and not RULES_PATH:
+            return default_prompt
+        # TO CHECK AND LOAD FROM RULES_PATH IF IT EXISTS
+        rules_path_obj = Path(RULES_PATH) if RULES_PATH else None
+        if rules_path_obj and rules_path_obj.exists():
+            try:
+                # TO LOAD JSON FROM FILE
+                with rules_path_obj.open("r", encoding="utf-8") as f:
+                    rules = json.load(f)
+                # TO RETRIEVE SYSTEM_PROMPT WITH DEFAULT FALLBACK WITHOUT MODIFICATION
+                prompt_data = rules.get("system_prompt", [default_prompt])
+                # TO HANDLE IF PROMPT_DATA IS STRING INSTEAD OF LIST
+                if isinstance(prompt_data, str):
+                    return prompt_data
+                # TO JOIN LIST INTO SINGLE STRING
+                return "\n".join(prompt_data)
+            except (json.JSONDecodeError, IOError) as e:
+                # TO LOG SPECIFIC ERROR AND FALL BACK TO DEFAULT
+                logger.error(f"Error reading or parsing RULES_PATH '{RULES_PATH}': {e}")
+                return default_prompt
+        # TO USE CONFIG SYSTEM_PROMPT IF RULES_PATH NOT USED
+        if system_prompt:
+            return system_prompt
+    except Exception as e:
+        # TO LOG UNEXPECTED ERROR AND FALL BACK
+        logger.error(f"Unexpected error in system_prefix: {e}")
+    # TO RETURN DEFAULT AS ULTIMATE FALLBACK
+    return default_prompt
 
 
 ####
 
 # Flags
-METADATA_TITLE = "🛠️ Generated by GIA System (GIA.py)"
+METADATA_TITLE = f"🛠️ Generated by {PROJECT_ROOT.name.upper()}-{hash(PROJECT_ROOT) % 10000}"
 dark_gray = Style.DIM + Fore.LIGHTBLACK_EX
 reset_style = Style.RESET_ALL
 
 ##################################################################################
 
-# LOGGER SETUP - FOR CONSISTENT LOGGING
+# LOGGER SETUP - FOR CONSISTENT logger
 logger = logging.getLogger(__name__)
-if not logger.handlers:
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG if CONFIG["DEBUG"] else logging.INFO)
+    
+
 
 ####
 
-
-# TIMESTAMP TAG - FOR LOGGING
+# TIMESTAMP TAG - FOR logger
 def tag() -> str:
-    """Generate timestamp for logging."""
+    """Generate timestamp for logger."""
     # TO FORMAT TIMESTAMP
     current_time = datetime.now().strftime("[%H:%M:%S]")
     return f"{current_time} : $ "
 
-
 ####
-
 
 # FILE HASH - FOR INTEGRITY CHECK
 def m_hash(filepath: str) -> str:
@@ -313,32 +353,13 @@ def m_hash(filepath: str) -> str:
 
 ####
 
-# CLI LOOP - UPDATED FOR QUEUES AND NON-BLOCKING POLL
-def cli_loop():
-    """Main CLI input loop with queue integration."""
-    while True:
-        cmd = input("CLI > ")
-        if cmd.strip():
-            input_queue.put(cmd)  # PUSH TO INPUT QUEUE FOR PROCESSING
-            output_queue.put(f"CLI Command: {cmd}")  # ECHO TO OUTPUT FOR BIDIRECTIONAL
-            # PROCESS COMMAND (UNIFIED HANDLER)
-            result = handle_command(cmd, is_gradio=False)
-            print(result)
-        # NON-BLOCKING POLL OUTPUT QUEUE
-        try:
-            while not output_queue.empty():
-                output = output_queue.get_nowait()
-                print(output)
-        except queue.Empty:
-            pass
-
-
 # GLOBAL QUEUES FOR BIDIRECTIONAL INTERACTION
 input_queue: queue.Queue = queue.Queue()  # COMMANDS FROM CLI/GRADIO TO PLUGINS/HANDLERS
 output_queue: queue.Queue = queue.Queue()  # STREAMING OUTPUTS/RESPONSES TO BOTH INTERFACES
-logging_queue: queue.Queue = queue.Queue()  # LOGS TO TERMINAL ONLY
+logger_queue: queue.Queue = queue.Queue()  # LOGS TO TERMINAL ONLY
 from queue import Empty
 
+# Excerpt from src/gia/GIA.py (complete handle_command function)
 def handle_command(
     cmd: str,
     chat_history: List[Dict[str, str]],
@@ -383,70 +404,104 @@ def handle_command(
                 raise TypeError("State must be gr.State or dict.")
         except (AttributeError, ValueError, TypeError) as e:
             logger.error(f"Invalid state in handle_command: {e}")
-            state_dict = {}  # Fallback to empty dict
+            state_dict = {}  # FALLBACK TO EMPTY DICT
 
     # TO CHECK LLM INITIALIZATION FOR NON-LOAD COMMANDS
-    if app_state.LLM is None and cmd_lower not in [".load", ".save", ".info", ".delete"]:
-        # Fallback: try to generate directly if LLM is available
+    if app_state.LLM is None and cmd_lower not in [".load", ".create", ".info", ".delete", ".unload"]:
+        # FALLBACK: TRY TO GENERATE DIRECTLY IF LLM IS AVAILABLE AND CMD NON-EMPTY
         if app_state.LLM is not None and cmd.strip():
             result = generate(cmd, system_prefix(), app_state.LLM, max_new_tokens=1024) + "\n"
-            if is_gradio:
-                if is_chat_fn:
-                    yield "", chat_history, gr.State(state_dict)
-                else:
-                    yield chat_history, gr.State(state_dict)
-                return
-            return result
-        error_msg = "Error: No model loaded. Please confirm a model first.\n"
-        if is_gradio:
-            if is_chat_fn:
-                yield "", chat_history, gr.State(state_dict)
-            else:
-                yield chat_history, gr.State(state_dict)
-            return
-        return error_msg
+        else:
+            error_msg = "Error: No model loaded. Please confirm a model first.\n"
+            result = error_msg
 
     use_query_engine = state_dict.get("use_query_engine_gr", False)
     try:
         # TO HANDLE BUILT-IN COMMANDS
-        if cmd_lower in [".load", ".save", ".info", ".delete"]:
-            if cmd_lower == ".save":
+        if cmd_lower in [".load", ".create", ".info", ".delete", ".unload"]:
+            if cmd_lower == ".create":
                 save_database()
                 use_query_engine = True
-                result = "Database saved. Query engine re-enabled.\n"
-                state_dict["status_gr"] = "Database saved"
+                result = "Database created. Query engine re-enabled.\n"
+                state_dict["status_gr"] = "Database created"
             elif cmd_lower == ".load":
                 result = load_database_wrapper(state_dict)
                 use_query_engine = True
                 state_dict["status_gr"] = "Database loaded"
             elif cmd_lower == ".info":
                 cpu_usage, memory_usage, gpu_usage = get_system_info()
-                num_entries = app_state.CHROMA_COLLECTION.count() if app_state.CHROMA_COLLECTION else 0
-                gpu_str = ' | '.join([f"GPU {i}: {load}%" for i, load in enumerate(gpu_usage)]) if gpu_usage else "No GPUs"
-                result = f"[Database Entries: {num_entries} | CPU: {cpu_usage}% | RAM: {memory_usage}% | {gpu_str}]\n"
-                state_dict["status_gr"] = "Info displayed"
+                result = (
+                    f"System Info:\n"
+                    f"CPU Usage: {cpu_usage}%\n"
+                    f"Memory Usage: {memory_usage}%\n"
+                    f"GPU Usage: {gpu_usage}%\n"
+                    f"Model: {app_state.MODEL_NAME or 'None'}\n"
+                    f"Database Loaded: {app_state.DATABASE_LOADED}\n"
+                )
+                state_dict["status_gr"] = "System info retrieved"
             elif cmd_lower == ".delete":
-                if app_state.CHROMA_COLLECTION:
-                    app_state.CHROMA_COLLECTION.delete()
-                    result = "Database successfully deleted.\n"
-                    state_dict["status_gr"] = "Database deleted"
+                db_path = Path(DB_PATH)
+                if db_path.exists():
+                    if is_gradio:
+                        logger.info("Deleting database...")
+                        try:
+                            import shutil
+                            shutil.rmtree(db_path)
+                            result = "Database deleted.\n"
+                        except Exception as e:
+                            result = f"Error deleting database: {str(e)}\n"
+                    else:
+                        confirm = input("Confirm delete database? (y/n): ").lower().strip()
+                        if confirm == 'y':
+                            try:
+                                import shutil
+                                shutil.rmtree(db_path)
+                                result = "Database deleted.\n"
+                            except Exception as e:
+                                result = f"Error deleting database: {str(e)}\n"
+                        else:
+                            result = "Delete canceled.\n"
+                    state_manager.set_state("DATABASE_LOADED", False)
+                    state_manager.set_state("INDEX", None)
+                    state_manager.set_state("QUERY_ENGINE", None)
                 else:
                     result = "No database to delete.\n"
-                    state_dict["status_gr"] = "Error"
-        # TO HANDLE PLUGIN COMMANDS (START WITH '.' BUT NOT BUILT-IN)
-        elif cmd_lower.startswith('.'):
-            # TO PARSE COMMAND SAFELY
+                state_dict["status_gr"] = "Database deleted"
+            elif cmd_lower == ".unload":
+                if app_state.LLM is None:
+                    result = "No model loaded to unload.\n"
+                else:
+                    try:
+                        if isinstance(app_state.LLM, HuggingFaceLLM):
+                            del app_state.LLM.model
+                            del app_state.LLM
+                            torch.cuda.empty_cache()
+                            gc.collect()
+                            result = "Local model unloaded and VRAM cleared.\n"
+                        else:  # LlamaOpenAI or similar
+                            del app_state.LLM
+                            gc.collect()
+                            result = "Online model unloaded.\n"
+                        state_manager.set_state("LLM", None)
+                        state_manager.set_state("MODEL_NAME", None)
+                        state_manager.set_state("MODEL_PATH", None)
+                        state_dict["status_gr"] = "Model unloaded"
+                    except Exception as e:
+                        result = f"Unload failed: {str(e)}\n"
+        # TO HANDLE PLUGIN COMMANDS (STARTS WITH .)
+        elif cmd_lower.startswith("."):
+            # PARSE COMMAND SAFELY WITH SHLEX FOR QUOTED SINGLE OPTIONAL ARG
             parts = shlex.split(cmd)
             if len(parts) == 0 or not parts[0].startswith('.') or len(parts[0]) <= 1:
                 raise ValueError("Invalid plugin command format. Must start with '.' followed by plugin name.")
             if len(parts) > 2:
-                raise ValueError("Command exceeds maximum 2 positions (plugin name and optional arg).")
-            plugin_name = parts[0][1:]
-            optional_arg = parts[1] if len(parts) > 1 else None
+                raise ValueError("Command exceeds maximum 2 positions (plugin name and optional quoted arg).")
+            plugin_name = parts[0][1:].lower()
+            optional_arg = parts[1].strip() if len(parts) > 1 else None  # SANITIZE WITH STRIP
             if plugin_name not in plugins:
                 raise KeyError(f"Plugin '{plugin_name}' not found in loaded plugins.")
             plugin = plugins[plugin_name]
-            # TO PREPARE WHITELISTED KWARGS
+            # PREPARE WHITELISTED DEFAULT KWARGS FOR INJECTION IF IN SIG
             available_kwargs = {
                 'llm': app_state.LLM,
                 'query_engine': app_state.QUERY_ENGINE,
@@ -456,38 +511,55 @@ def handle_command(
             sig = inspect.signature(plugin)
             kwargs_to_pass = {k: v for k, v in available_kwargs.items() if k in sig.parameters}
             if optional_arg is not None:
-                kwargs_to_pass['arg'] = optional_arg
-            # TO BIND AND CALL PLUGIN IN SANDBOX
-            bound = sig.bind_partial(**kwargs_to_pass)
+                # CONDITIONAL ADD: 'ARG' IF IN SIG, ELSE 'QUERY' IF IN SIG, ELSE IGNORE WITH WARNING
+                if 'arg' in sig.parameters:
+                    kwargs_to_pass['arg'] = optional_arg
+                elif 'query' in sig.parameters:
+                    kwargs_to_pass['query'] = optional_arg
+                else:
+                    logger.warning(f"Ignoring optional_arg '{optional_arg}' for plugin '{plugin_name}' as neither 'arg' nor 'query' in signature.")
+            try:
+                # VALIDATE BINDING: PARTIAL THEN FULL TO CATCH MISSING REQUIRED
+                bound = sig.bind_partial(**kwargs_to_pass)
+                sig.bind(**kwargs_to_pass)  # RAISE IF MISSING REQUIRED
+            except TypeError as e:
+                missing = [p for p in sig.parameters if p not in kwargs_to_pass and sig.parameters[p].default is inspect.Parameter.empty]
+                error_msg = f"Plugin '{plugin_name}' missing required args: {', '.join(missing)}. Load model/database first."
+                raise ValueError(error_msg) from e
+            # START SANDBOX WITH BOUND ARGS/KWARGS
             sandbox = PluginSandbox(plugin_name, plugin, bound.args, bound.kwargs)
             sandbox.start()
             with sandboxes_lock:
                 active_sandboxes[plugin_name] = sandbox
             try:
                 collected = ""
-                history = chat_history  # Shared ref; plugin appends in-place
+                history = chat_history  # SHARED REF FOR IN-PLACE APPENDS
                 start_time = time.time()
-                max_poll_time = 3600  # 1 hour timeout for long plugins
+                max_poll_time = 3600  # TIMEOUT FOR LONG-RUNNING PLUGINS
                 while True:
                     try:
-                        item = sandbox.output_queue.get(timeout=0.1)  # Non-blocking poll to avoid hang
+                        item = sandbox.output_queue.get(timeout=0.05)  # OPTIMIZED LOW TIMEOUT
                         if item is None:
                             break
                         if isinstance(item, BaseException):
                             raise item
                         if isinstance(item, list) and all(isinstance(d, dict) for d in item):
-                            # History yielded; yield to refresh UI with appended message
+                            # HISTORY YIELDED: UPDATE AND YIELD FOR UI
                             logger.debug(f"Plugin '{plugin_name}' yielded history; yielding for UI refresh.")
-                            history = item  # Update shared
+                            history = item
                             if is_gradio:
                                 if is_chat_fn:
                                     yield "", history, gr.State(state_dict)
                                 else:
                                     yield history, gr.State(state_dict)
                             continue
-                        msg = str(item) if not isinstance(item, str) else item  # Safe for other types
+                        # SAFE CONVERSION: JSON IF DICT/LIST, ELSE STR
+                        try:
+                            msg = json.dumps(item) if isinstance(item, (dict, list)) else str(item)
+                        except Exception:
+                            msg = str(item)
                         if msg.strip():
-                            history = append_to_chatbot(history, msg, metadata={"title": METADATA_TITLE})
+                            history = append_to_chatbot(history, msg, metadata={"role": "assistant"})
                         if is_gradio:
                             if is_chat_fn:
                                 yield "", history, gr.State(state_dict)
@@ -497,67 +569,60 @@ def handle_command(
                             print(msg, flush=True)
                             collected += msg + "\n"
                     except Empty:
-                        # Yield to keep UI responsive during long run
+                        # YIELD ON EMPTY FOR RESPONSIVE UI, NO CPU SPIN
                         if is_gradio:
                             if is_chat_fn:
                                 yield "", history, gr.State(state_dict)
                             else:
                                 yield history, gr.State(state_dict)
-                        time.sleep(0.1)  # Poll interval to avoid CPU spin
+                        time.sleep(0.05)
                         if time.time() - start_time > max_poll_time:
                             raise TimeoutError(f"Plugin {plugin_name} timed out after {max_poll_time}s")
                 if not is_gradio:
-                    return collected.strip()
+                    return collected.strip() or "Plugin completed with no output."
             finally:
                 sandbox.stop()
                 with sandboxes_lock:
                     active_sandboxes.pop(plugin_name, None)
-        # TO HANDLE QUERIES (NON-DOT COMMANDS)
+        # TO HANDLE NORMAL QUERIES (NON-DOT)
         else:
             if not cmd.strip():
-                result = "You entered an empty query. Please try again.\n"
-                state_dict["status_gr"] = "Error"
-            else:
-                if use_query_engine and app_state.QUERY_ENGINE is not None:
-                    response = app_state.QUERY_ENGINE.query(cmd)
-                    streamed_text = ""
-                    if hasattr(response, "response_gen"):
-                        for chunk in response.response_gen:
-                            streamed_text += chunk
-                    else:
-                        streamed_text = response.response if hasattr(response, 'response') else str(response)
-                    result = streamed_text + "\n"
-                    if streamed_text.strip() in ["", "Empty Response"]:
-                        result = generate(cmd, system_prefix(), app_state.LLM, max_new_tokens=1024) + "\n"
-                        state_dict["status_gr"] = "Fallback response generated"
-                    else:
-                        state_dict["status_gr"] = "Response generated"
+                result = "Empty query.\n"
+            elif use_query_engine and app_state.QUERY_ENGINE:
+                response = app_state.QUERY_ENGINE.query(cmd)
+                streamed_text = ""
+                if hasattr(response, "response_gen"):
+                    for chunk in response.response_gen:
+                        streamed_text += chunk
                 else:
-                    result = generate(cmd, system_prefix(), app_state.LLM, max_new_tokens=1024) + "\n"
-                    state_dict["status_gr"] = "Response generated"
-        # TO UPDATE STATE FOR QUERY ENGINE
-        state_dict["use_query_engine_gr"] = use_query_engine
-        # TO RETURN BASED ON INTERFACE WITH DEDUP CHECK
-        if result.strip() and not any(h.get("content") == result for h in chat_history[-3:]):
+                    streamed_text = response.response if hasattr(response, 'response') else str(response)
+                result = streamed_text + "\n" if streamed_text.strip() not in ["", "Empty Response"] else generate(cmd, system_prefix(), app_state.LLM, max_new_tokens=1024) + "\n"
+            else:
+                result = generate(cmd, system_prefix(), app_state.LLM, max_new_tokens=1024) + "\n"
+            state_dict["status_gr"] = "Response generated"
+            state_dict["use_query_engine_gr"] = use_query_engine
+        # Uniform output handling
+        if result.strip() and not any(h.get("content", "") == result.strip() for h in chat_history[-3:]):
             append_to_chatbot(chat_history, result, metadata={"role": "assistant"})
         if is_gradio:
             if is_chat_fn:
                 yield "", chat_history, gr.State(state_dict)
             else:
                 yield chat_history, gr.State(state_dict)
-            return
-        return result
-    except (ValueError, KeyError, Exception) as e:
-        error_msg = f"Error processing command: {str(e)}"
-        state_dict["status_gr"] = "Error"
+        else:
+            return result
+
+    except Exception as e:
+        error_msg = f"Command failed: {str(e)}\n"
+        logger.error(error_msg)
         if is_gradio:
+            append_to_chatbot(chat_history, error_msg, metadata={"role": "assistant"})
             if is_chat_fn:
                 yield "", chat_history, gr.State(state_dict)
             else:
                 yield chat_history, gr.State(state_dict)
-            return
-        return error_msg
-
+        else:
+            return error_msg
 
 ####
 
@@ -606,204 +671,97 @@ def update_model_dropdown(directory: str) -> Tuple[gr.Dropdown, List[Dict[str, s
         {"role": "assistant", "content": f"Found {len(folders)} model folders."}
     ]
 
-
-####
-
-def fetch_openai_models() -> list:
-    """Fetch available OpenAI models from the API for dropdown choices, only valid chat/completion models."""
-    valid_models = [
-        "o1", "o1-2024-12-17", "o1-pro", "o1-pro-2025-03-19", "o1-preview", "o1-preview-2024-09-12", "o1-mini", "o1-mini-2024-09-12",
-        "o3-mini", "o3-mini-2025-01-31", "o3", "o3-2025-04-16", "o3-pro", "o3-pro-2025-06-10", "o4-mini", "o4-mini-2025-04-16",
-        "gpt-4", "gpt-4-32k", "gpt-4-1106-preview", "gpt-4-0125-preview", "gpt-4-turbo-preview", "gpt-4-vision-preview", "gpt-4-1106-vision-preview",
-        "gpt-4-turbo-2024-04-09", "gpt-4-turbo", "gpt-4o", "gpt-4o-audio-preview", "gpt-4o-audio-preview-2024-12-17", "gpt-4o-audio-preview-2024-10-01",
-        "gpt-4o-mini-audio-preview", "gpt-4o-mini-audio-preview-2024-12-17", "gpt-4o-2024-05-13", "gpt-4o-2024-08-06", "gpt-4o-2024-11-20",
-        "gpt-4.5-preview", "gpt-4.5-preview-2025-02-27", "chatgpt-4o-latest", "gpt-4o-mini", "gpt-4o-mini-2024-07-18", "gpt-4-0613",
-        "gpt-4-32k-0613", "gpt-4-0314", "gpt-4-32k-0314", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4.1-2025-04-14",
-        "gpt-4.1-mini-2025-04-14", "gpt-4.1-nano-2025-04-14", "gpt-3.5-turbo", "gpt-3.5-turbo-16k", "gpt-3.5-turbo-0125", "gpt-3.5-turbo-1106",
-        "gpt-3.5-turbo-0613", "gpt-3.5-turbo-16k-0613", "gpt-3.5-turbo-0301", "text-davinci-003", "text-davinci-002", "gpt-3.5-turbo-instruct",
-        "text-ada-001", "text-babbage-001", "text-curie-001", "ada", "babbage", "curie", "davinci", "gpt-35-turbo-16k", "gpt-35-turbo",
-        "gpt-35-turbo-0125", "gpt-35-turbo-1106", "gpt-35-turbo-0613", "gpt-35-turbo-16k-0613"
-    ]
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return valid_models
-    try:
-        headers = {"Authorization": f"Bearer {api_key}"}
-        resp = requests.get("https://api.openai.com/v1/models", headers=headers, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        # Only include valid models present in the API response
-        available = set(m["id"] for m in data.get("data", []))
-        filtered = [m for m in valid_models if m in available]
-        return filtered or valid_models
-    except Exception as e:
-        logger.warning(f"Could not fetch OpenAI models for dropdown: {e}")
-        return valid_models
-
-def load_llm(mode: str, config: Dict[str, Any]) -> Tuple[str, Any]:
-    """Load LLM based on mode (local or online)."""
-    if mode == "Local":
-        clear_vram()
-    try:
-        if mode == "Local":
-            model_path = config.get("model_path")
-            if not model_path:
-                raise ValueError("Model path required for Local mode.")
-            model = GPTQModel.from_quantized(model_path, device_map=DEVICE_MAP)
-            tokenizer = model.tokenizer
-            shared_generate_kwargs = {
-                "temperature": TEMPERATURE,
-                "do_sample": True,
-                "top_k": TOP_K,
-                "top_p": TOP_P,
-                "min_p": 0.0,
-                "repetition_penalty": REPETITION_PENALTY,
-                "no_repeat_ngram_size": NO_REPEAT_NGRAM_SIZE,
-                "use_cache": True,
-                "eos_token_id": tokenizer.eos_token_id,
-            }
-            logits_processor = LogitsProcessorList([PresencePenaltyLogitsProcessor()])
-            try:
-                model.config.attn_implementation = "sdpa"
-                torch.backends.cuda.enable_mem_efficient_sdp(True)
-                model = torch.compile(
-                    model, mode="max-autotune", fullgraph=True
-                )
-                logger.info("Local model optimizations applied.")
-            except Exception as e:
-                logger.warning(f"Local optimizations skipped: {e}")
-            llm = HuggingFaceLLM(
-                model=model,
-                tokenizer=tokenizer,
-                context_window=CONTEXT_WINDOW,
-                max_new_tokens=MAX_NEW_TOKENS,
-                generate_kwargs={
-                    **shared_generate_kwargs,
-                    "logits_processor": logits_processor,
-                },
-                system_prompt=system_prefix(),
-                device_map=DEVICE_MAP,
-                model_name=model_path,
-                stopping_ids=[151643, 151645, 23483, 4689, 57208],
-            )
-            base_name = os.path.basename(model_path)
-            msg = f"Loaded local model: {base_name}"
-        elif mode == "HuggingFace Online":
-            token = os.getenv("HF_TOKEN")
-            if not token:
-                raise ValueError("HF_TOKEN not set in environment. Please set it via 'export HF_TOKEN=your_token' in your terminal.")
-            model_name = config.get("model_name")
-            if not model_name:
-                raise ValueError("Model name required for HuggingFace Online.")
-            llm = HuggingFaceInferenceAPI(
-                model_name=model_name,
-                token=token,
-                context_window=CONTEXT_WINDOW,
-                max_new_tokens=MAX_NEW_TOKENS,
-                temperature=TEMPERATURE,
-                do_sample=True,
-                top_k=TOP_K,
-                top_p=TOP_P,
-                repetition_penalty=REPETITION_PENALTY,
-            )
-            msg = f"Loaded HF Online model: {model_name}"
-        elif mode == "OpenAI":
-            api_key = os.getenv("OPENAI_API_KEY")
-            if not api_key:
-                raise ValueError("OPENAI_API_KEY not set in environment. Please set it via 'export OPENAI_API_KEY=sk-your_key' in your terminal.")
-            model_name = config.get("model_name")
-            if not model_name:
-                raise ValueError("Model name required for OpenAI.")
-            # Only pass supported parameters for each model family
-            # o1, o3, o4 do not support temperature/top_p, etc
-            if model_name.startswith("o1") or model_name.startswith("o3") or model_name.startswith("o4"):
-                llm = LlamaOpenAI(
-                    model=model_name,
-                    api_key=api_key
-                )
-            else:
-                llm = LlamaOpenAI(
-                    model=model_name,
-                    api_key=api_key,
-                    temperature=TEMPERATURE,
-                    max_tokens=MAX_NEW_TOKENS,
-                    additional_kwargs={"top_p": TOP_P},
-                )
-            msg = f"Loaded OpenAI model: {model_name}"
-        else:
-            raise ValueError(f"Invalid mode: {mode}")
-        return msg, llm
-    except Exception as e:
-        error_msg = f"Failed to load LLM in {mode} mode: {str(e)}"
-        logger.error(error_msg)
-        return error_msg, None
+###
 
 def finalize_model_selection(
-    selected_folder: str, session_state: gr.State, mode: str = "Local"
+    selected_folder: str,
+    session_state: gr.State,
+    mode: str = "Local",
+    chat_history: List[Dict[str, str]] = None,
 ) -> Tuple[List[Dict[str, str]], gr.State, str]:
+    """Finalize model selection with unload/load if changed, preserving history.
+    Args:
+        selected_folder: Selected local folder.
+        session_state: Gradio state.
+        mode: Selected mode.
+        chat_history: Current chat history to preserve.
+    Returns:
+        Updated history, state, display name.
+    """
+    # TO SET PRECISION FOR PERF ON AMPERE+ GPUS (RTX 4080)
     torch.set_float32_matmul_precision('high')
     app_state = load_state()
+    # TO GET STATE DICT SAFELY
     state_dict = session_state.value if isinstance(session_state, gr.State) else {}
     if not isinstance(state_dict, dict):
         state_dict = {"use_query_engine_gr": True, "status_gr": "", "mode": "Local"}
     state_dict["mode"] = mode
     state_manager.set_state("MODE", mode)
     logger.info(f"Model mode set to {mode} globally.")
-    # Only require folder for Local mode
+    chat_history = chat_history or []  # TO ENSURE HISTORY IF NONE
+    # TO DETERMINE CONFIG AND CHECK IF CHANGED
     if mode == "Local":
         if not selected_folder:
-            return (
-                [{"role": "assistant", "content": "No folder selected!"}],
-                gr.State(state_dict),
-                "Model: Selection Failed",
-            )
-        state_dict["model_path_gr"] = selected_folder
-        if app_state.MODEL_PATH == selected_folder:
+            msg = "No folder selected!"
+            return append_to_chatbot(chat_history, msg), gr.State(state_dict), "Model: Selection Failed"
+        current_path = app_state.MODEL_PATH
+        if current_path == selected_folder:
             base = os.path.basename(selected_folder)
-            return (
-                [
-                    {
-                        "role": "assistant",
-                        "content": f"Model unchanged: {base}",
-                    }
-                ],
-                gr.State(state_dict),
-                f"Model: {base}",
-            )
+            msg = f"Model unchanged: {base}"
+            return append_to_chatbot(chat_history, msg), gr.State(state_dict), f"Model: {base}"
         config = {"model_path": selected_folder}
-    elif mode == "HuggingFace Online":
+        state_dict["model_path_gr"] = selected_folder
+        model_identifier = selected_folder
+    elif mode == "HuggingFace":
         model_name = state_dict.get("hf_model_name", "deepseek-ai/DeepSeek-R1")
+        current_name = state_manager.get_state("MODEL_NAME")
+        if current_name == model_name:
+            msg = f"Model unchanged: {model_name}"
+            return append_to_chatbot(chat_history, msg), gr.State(state_dict), f"Model: {model_name}"
         config = {"model_name": model_name}
         state_dict["model_path_gr"] = None
+        model_identifier = model_name
     elif mode == "OpenAI":
-        # Use fetch_openai_models for latest models
         available_models = fetch_openai_models()
         default_model = available_models[0] if available_models else "gpt-4o"
         model_name = state_dict.get("openai_model_name", default_model)
+        current_name = state_manager.get_state("MODEL_NAME")
+        if current_name == model_name:
+            msg = f"Model unchanged: {model_name}"
+            return append_to_chatbot(chat_history, msg), gr.State(state_dict), f"Model: {model_name}"
         config = {"model_name": model_name}
         state_dict["model_path_gr"] = None
+        model_identifier = model_name
+    elif mode == "OpenRouter":
+        model_name = state_dict.get("openrouter_model_name", "x-ai/grok-3-mini")
+        current_name = state_manager.get_state("MODEL_NAME")
+        if current_name == model_name:
+            msg = f"Model unchanged: {model_name}"
+            return append_to_chatbot(chat_history, msg), gr.State(state_dict), f"Model: {model_name}"
+        config = {"model_name": model_name}
+        state_dict["model_path_gr"] = None
+        model_identifier = model_name
     else:
-        return (
-            [{"role": "assistant", "content": f"Unknown mode: {mode}"}],
-            gr.State(state_dict),
-            "Model: Selection Failed",
-        )
+        msg = f"Unknown mode: {mode}"
+        return append_to_chatbot(chat_history, msg), gr.State(state_dict), "Model: Selection Failed"
+    # TO UNLOAD IF CHANGING (SKIPPED ABOVE IF UNCHANGED)
+    if state_manager.get_state("LLM") is not None:
+        unload_msg = unload_model()
+        chat_history = append_to_chatbot(chat_history, unload_msg)
+    # TO LOAD NEW MODEL
     msg, llm = load_llm(mode, config)
     if llm is None:
-        return (
-            [{"role": "assistant", "content": f"Failed to load: {msg}"}],
-            gr.State(state_dict),
-            "Model: Load Failed",
-        )
+        return append_to_chatbot(chat_history, f"Failed to load: {msg}"), gr.State(state_dict), "Model: Load Failed"
+    
+    # TO SET GLOBAL LLM FOR LLAMA-INDEX
     Settings.llm = llm
     state_manager.set_state("LLM", llm)
+    # TO EXTRACT MODEL NAME FOR STATE
     state_dict["model_name_gr"] = msg.split(": ")[-1] if ": " in msg else "Unknown"
     logger.info(f"Loaded LLM type: {type(llm).__name__} for mode {mode}.")
-    return (
-        [{"role": "assistant", "content": msg}],
-        gr.State(state_dict),
-        f"Model: {state_dict['model_name_gr']}",
-    )
+    chat_history = append_to_chatbot(chat_history, msg)
+    display_name = f"Model: {state_dict['model_name_gr']}"
+    return chat_history, gr.State(state_dict), display_name
 
 ####
 
@@ -840,7 +798,6 @@ def process_input(user_text: str, state: gr.State, chat_history: List[Dict[str, 
     return response, use_query_engine_gr, state, chat_history  # RETURN UPDATED SHARED HISTORY
 
 ####
-
 
 def handle_load_button(state: gr.State) -> Tuple[List[Dict[str, str]], gr.State]:
     """Handle load button action with early initialization and deduplication.
@@ -903,33 +860,47 @@ def handle_load_button(state: gr.State) -> Tuple[List[Dict[str, str]], gr.State]
 
 ####
 
-
 def chat_fn(
-    message: str, chat_history: List[Dict[str, str]], state: gr.State
-) -> Generator[Tuple[str, List[Dict[str, str]], gr.State], None, None]:
+    message: str, 
+    chat_history: List[Dict[str, str]], 
+    state: Union[gr.State, Dict[str, Any]]
+) -> Generator[Tuple[str, List[Dict[str, str]], Union[gr.State, Dict[str, Any]]], None, None]:
     """Handle chat input.
-
     Args:
         message: User input message.
         chat_history: Chat history.
-        state: Gradio state.
-
+        state: Gradio state or dict.
     Yields:
         Textbox value, updated chat history, updated state.
     """
-    # TO LOAD STATE
+    # TO LOAD STATE FOR DOT ACCESS
     app_state = load_state()
-    state_dict = state.value if isinstance(state.value, dict) else {}
-    # TO APPEND USER MESSAGE
+    # TO EXTRACT STATE DICT SAFELY
+    state_dict = state.value if isinstance(state, gr.State) else state
+    # TO HANDLE EMPTY MESSAGE
+    if not message.strip():
+        yield "", chat_history, state if isinstance(state, gr.State) else state_dict
+        return
+    # TO APPEND USER MESSAGE TO HISTORY
     append_to_chatbot(chat_history, message, metadata={"role": "user"})
-    yield "", chat_history, state
+    # TO YIELD UPDATED HISTORY
+    yield "", chat_history, state if isinstance(state, gr.State) else state_dict
+    # TO PROCESS WITH SHARED HISTORY AND TRY/EXCEPT FOR ROBUSTNESS
+    try:
+        response, use_query_engine_gr, state, chat_history = process_input(message, state, chat_history)
+        # TO UPDATE STATE DICT
+        state_dict = state.value if isinstance(state, gr.State) else state
+        state_dict["use_query_engine_gr"] = use_query_engine_gr
+        state_dict["status_gr"] = "Response generated"
+        # TO YIELD FINAL UPDATED
+        yield "", chat_history, gr.State(state_dict) if isinstance(state, gr.State) else state_dict
+    except Exception as e:
+        # TO LOG ERROR AND APPEND TO HISTORY
+        logger.error(f"Chat processing error: {e}")
+        append_to_chatbot(chat_history, f"Error: {str(e)}", metadata={"role": "assistant"})
+        # TO YIELD ERROR UPDATED
+        yield "", chat_history, state if isinstance(state, gr.State) else state_dict
 
-    # TO PROCESS WITH SHARED HISTORY
-    response, use_query_engine_gr, state, chat_history = process_input(message, state, chat_history)
-    state_dict = state.value
-    state_dict["use_query_engine_gr"] = use_query_engine_gr
-    state_dict["status_gr"] = "Response generated"
-    yield "", chat_history, gr.State(state_dict)
 
 # BACKGROUND THREAD FOR GRADIO OUTPUT POLLING
 def gradio_output_poller(chatbot_component, state):
@@ -942,194 +913,306 @@ def gradio_output_poller(chatbot_component, state):
             pass
 
 ####
-from functools import partial
 
-def launch_app() -> None:
-    """Launch Gradio application."""
-    with gr.Blocks(
-        title="SCRPS AI",
-        delete_cache=(60, 60),
-        theme="d8ahazard/rd_blue",
-        css="#model-name-display{text-align:left;width:100%;font-size:1.1em;margin-top:0.5em;}",
-    ) as demo:
-        model_name_display = gr.Markdown(
-            "Loading model...", elem_id="model-name-display"
-        )
-        plugins = load_plugins()
-        session_state = gr.State(
-            {
-                "use_query_engine_gr": True,
-                "status_gr": "",
-                "model_name_gr": "Unknown Model",
-                "model_path_gr": None,
-                "mode": "Local",
-                "hf_model_name": "meta-llama/Llama-2-7b-chat-hf",
-                "openai_model_name": "gpt-3.5-turbo",
-            }
-        )
-        chatbot = gr.Chatbot(type="messages", value=[], height=777)
-        msg = gr.Textbox(placeholder="Enter your message or command (e.g., .gen)")
-        submit_btn = gr.Button("Submit")
+def confirm_model_handler(selected_folder, state, mode, hf_model, openai_model):
+    if hasattr(state, 'value'):
+        state_dict = state.value
+    else:
+        state_dict = state
+    logger.debug(f"Confirming model for mode: {mode}, selected_folder: {selected_folder}, hf_model: {hf_model}, openai_model: {openai_model}")
+    if mode == "HuggingFace":
+        state_dict["hf_model_name"] = hf_model
+    elif mode == "OpenAI":
+        state_dict["openai_model_name"] = openai_model
+    return finalize_model_selection(selected_folder, gr.State(state_dict), mode)
 
-        # Add mode selection radio
-        mode_radio = gr.Radio(
-            choices=["Local", "HuggingFace Online", "OpenAI"],
-            value="Local",
-            label="Model Mode"
-        )
-        # Warning markdown for API keys
-        warning_md = gr.Markdown("", visible=False)
+import sys  # FOR SYS.STDIN.READLINE() AND FLUSH
+import threading
+from types import GeneratorType  # FOR ISINSTANCE CHECK ON GENERATOR
 
-        # Local UI (visible only in Local mode)
-        with gr.Row(visible=True) as local_row:
-            models_dir_input = gr.Textbox(label="Models Directory", value=MODEL_PATH)
-            folder_dropdown = gr.Dropdown(choices=[], label="Select a Model")
-            scan_dir_button = gr.Button("Scan Directory")
+def launch_app(args: argparse.Namespace) -> None:
+    """Launch Gradio application in a background thread (if not CLI-only) and run CLI loop in main thread.
 
-        # HF Online UI (hidden initially)
-        with gr.Row(visible=False) as hf_row:
-            hf_model_dropdown = gr.Dropdown(
-                choices=[
-                    "deepseek-ai/DeepSeek-R1",
-                    "Qwen/Qwen3-30B-A3B-Instruct-2507",
-                    "meta-llama/Llama-2-7b-chat-hf",
-                    "mistralai/Mistral-7B-Instruct-v0.1",
-                    "google/gemma-7b-it",
-                    "Qwen/Qwen3-8B",
-                ],
-                label="HF Model",
-                value="deepseek-ai/DeepSeek-R1",
+    Args:
+        args: Parsed command-line arguments, including --cli flag.
+    """
+    # TO SET UNBUFFERED OUTPUT FOR RELIABLE PRINTS IN THREADED WSL ENV
+    import os
+    os.environ["PYTHONUNBUFFERED"] = "1"
+
+    # TO INITIALIZE SIGNAL HANDLING FOR GRACEFUL EXIT
+    import signal
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    # EVENT FOR SIGNALING GRADIO LAUNCH COMPLETE
+    launch_event = threading.Event()
+
+    # Launch in background thread for non-blocking terminal
+    def threaded_launch() -> None:
+        """Thread target to launch Gradio server, with demo built inside for thread-safe async init."""
+        # SAFEGUARD: CREATE AND SET NEW EVENT LOOP FOR THIS THREAD
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        # BUILD DEMO INSIDE THREAD TO BIND ASYNC EVENTS CORRECTLY
+        with gr.Blocks(
+            title="SCRPS AI",
+            delete_cache=(60, 60),
+            theme="d8ahazard/rd_blue",
+            css="#model-name-display{text-align:left;width:100%;font-size:1.1em;margin-top:0.5em;}",
+        ) as demo:
+            model_name_display = gr.Markdown(
+                "Loading model...", elem_id="model-name-display"
             )
-
-        # OpenAI UI (hidden initially)
-        with gr.Row(visible=False) as openai_row:
-            openai_model_dropdown = gr.Dropdown(
-                choices=fetch_openai_models(),
-                label="OpenAI Model",
-                value="gpt-4o",
+            plugins = load_plugins()
+            session_state = gr.State(
+                {
+                    "use_query_engine_gr": True,
+                    "status_gr": "",
+                    "model_name_gr": "Unknown Model",
+                    "model_path_gr": None,
+                    "mode": "Local",
+                    "hf_model_name": "deepseek-ai/DeepSeek-R1",
+                    "openai_model_name": "gpt-3.5-turbo",
+                    "openrouter_model_name": "x-ai/grok-3-mini",
+                }
             )
-
-        confirm_model_button = gr.Button("Confirm Model")
-        with gr.Row():
-            load_button = gr.Button("Load Database")
-        # PLUGIN GROUPING IN ACCORDION WITH ROW
-        with gr.Accordion("Plugins", open=True):
+            chatbot = gr.Chatbot(type="messages", value=[], height=777)
+            msg = gr.Textbox(placeholder="Enter your message or command (e.g., .gen)")
+            submit_btn = gr.Button("Submit")
+            # Add mode selection radio without xAI
+            mode_radio = gr.Radio(
+                choices=["Local", "HuggingFace", "OpenAI", "OpenRouter"],
+                value="Local",
+                label="Model Mode"
+            )
+            # Warning markdown for API keys
+            warning_md = gr.Markdown("", visible=False)
+            # Local UI (visible only in Local mode)
+            with gr.Row(visible=True) as local_row:
+                models_dir_input = gr.Textbox(label="Models Directory", value=MODEL_PATH)
+                folder_dropdown = gr.Dropdown(choices=[], label="Select a Model")
+                scan_dir_button = gr.Button("Scan Directory")
+            # HF UI (hidden initially)
+            with gr.Row(visible=False) as hf_row:
+                hf_model_dropdown = gr.Dropdown(
+                    choices=[
+                        "deepseek-ai/DeepSeek-R1",
+                        "Qwen/Qwen3-235B-A22B-Instruct-2507",
+                        "meta-llama/Llama-2-7b-chat-hf",
+                        "mistralai/Mistral-7B-Instruct-v0.1",
+                        "google/gemma-7b-it",
+                        "Qwen/Qwen3-8B",
+                    ],
+                    label="HF Model",
+                    value="deepseek-ai/DeepSeek-R1",
+                )
+            # OpenAI UI (hidden initially)
+            with gr.Row(visible=False) as openai_row:
+                openai_model_dropdown = gr.Dropdown(
+                    choices=fetch_openai_models(),
+                    label="OpenAI Model",
+                    value="gpt-4o",
+                )
+            # OpenRouter UI (hidden initially) with manual entry
+            with gr.Row(visible=False) as openrouter_row:
+                openrouter_model_text = gr.Textbox(
+                    label="OpenRouter Model",
+                    value="x-ai/grok-3-mini",
+                    placeholder="Enter OpenRouter model name (e.g., x-ai/grok-3-mini)"
+                )
+            confirm_model_button = gr.Button("Confirm Model")
             with gr.Row():
-                if not plugins:
-                    gr.Markdown("No plugins loaded.")
+                load_button = gr.Button("Load Database")
+            # PLUGIN GROUPING IN ACCORDION WITH ROW
+            with gr.Accordion("Plugins", open=True):
+                with gr.Row():
+                    if not plugins:
+                        gr.Markdown("No plugins loaded.")
+                    else:
+                        for plugin_name in plugins.keys():
+                            btn = gr.Button(value=plugin_name.capitalize())
+                            def plugin_handler_simple(
+                                name: str,
+                                chat_history: List[Dict[str, str]],
+                                state: gr.State
+                            ) -> Generator[Tuple[List[Dict[str, str]], gr.State], None, None]:
+                                logger.debug(f"Clicked plugin: {name}")
+                                try:
+                                    handler_gen = handle_command(
+                                        f".{name}",
+                                        chat_history=chat_history,
+                                        is_gradio=True,
+                                        is_chat_fn=False,
+                                        state=state
+                                    )
+                                    for updated in handler_gen:
+                                        if isinstance(updated, tuple) and len(updated) == 2:
+                                            yield updated[0], updated[1]
+                                        else:
+                                            logger.warning("Invalid handler yield; skipping.")
+                                    yield chat_history, state
+                                except Exception as e:
+                                    logger.error(f"Plugin {name} error: {e}")
+                                    yield chat_history, state
+                            btn.click(
+                                fn=partial(plugin_handler_simple, plugin_name),
+                                inputs=[chatbot, session_state],
+                                outputs=[chatbot, session_state],
+                                queue=True,
+                            )
+            # UI logic for mode switching with dynamic HF fetch
+            def update_mode_visibility(selected_mode: str, state):
+                if hasattr(state, 'value'):
+                    state_dict = state.value
                 else:
-                    for plugin_name in plugins.keys():
-                        btn = gr.Button(value=plugin_name.capitalize())
-                        def plugin_handler_simple(
-                            name: str,
-                            chat_history: List[Dict[str, str]],
-                            state: gr.State
-                        ) -> Generator[Tuple[List[Dict[str, str]], gr.State], None, None]:
-                            try:
-                                handler_gen = handle_command(
-                                    f".{name}",
-                                    chat_history=chat_history,
-                                    is_gradio=True,
-                                    is_chat_fn=False,
-                                    state=state
-                                )
-                                for updated in handler_gen:
-                                    if isinstance(updated, tuple) and len(updated) == 2:
-                                        yield updated[0], updated[1]
-                                    else:
-                                        logger.warning("Invalid handler yield; skipping.")
-                                yield chat_history, state
-                            except Exception as e:
-                                logger.error(f"Plugin {name} error: {e}")
-                                yield chat_history, state
-                        btn.click(
-                            fn=partial(plugin_handler_simple, plugin_name),
-                            inputs=[chatbot, session_state],
-                            outputs=[chatbot, session_state],
-                            queue=True,
-                        )
-        # UI logic for mode switching
-        def update_mode_visibility(selected_mode: str, state):
-            # Robustly handle both gr.State and dict
-            if hasattr(state, 'value'):
-                state_dict = state.value
-            else:
-                state_dict = state
-            if not isinstance(state_dict, dict):
-                state_dict = {"mode": selected_mode}
-            state_dict["mode"] = selected_mode
-            warning_value = ""
-            warning_visible = False
-            if selected_mode == "HuggingFace Online":
-                if not os.getenv("HF_TOKEN"):
-                    warning_value = "HF_TOKEN not detected. Please set it in your environment: `export HF_TOKEN=your_token_here` in your terminal and restart the app."
-                    warning_visible = True
-            elif selected_mode == "OpenAI":
-                if not os.getenv("OPENAI_API_KEY"):
-                    warning_value = "OPENAI_API_KEY not detected. Please set it in your environment: `export OPENAI_API_KEY=sk-your_key_here` in your terminal and restart the app."
-                    warning_visible = True
-            return (
-                gr.update(visible=selected_mode == "Local"),
-                gr.update(visible=selected_mode == "HuggingFace Online"),
-                gr.update(visible=selected_mode == "OpenAI"),
-                gr.update(value=warning_value, visible=warning_visible),
-                gr.State(state_dict),
+                    state_dict = state
+                if not isinstance(state_dict, dict):
+                    state_dict = {"mode": selected_mode}
+                state_dict["mode"] = selected_mode
+                warning_value = ""
+                warning_visible = False
+                hf_update = gr.update()
+                if selected_mode == "HuggingFace":
+                    if not os.getenv("HF_TOKEN"):
+                        warning_value = "HF_TOKEN not detected. Please set it in your environment: `export HF_TOKEN=your_token_here` in your terminal and restart the app."
+                        warning_visible = True
+                    # Dynamic fetch from fireworks-ai
+                    try:
+                        url = "https://huggingface.co/api/models?inference_provider=fireworks-ai"
+                        response = requests.get(url, timeout=10)
+                        response.raise_for_status()
+                        models = [m['id'] for m in response.json()]
+                        hf_update = gr.update(choices=models, value=models[0] if models else "deepseek-ai/DeepSeek-R1")
+                        logger.debug(f"Fetched {len(models)} models from fireworks-ai")
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch HF models from fireworks-ai: {e}. Using fallback list.")
+                elif selected_mode == "OpenAI":
+                    if not os.getenv("OPENAI_API_KEY"):
+                        warning_value = "OPENAI_API_KEY not detected. Please set it in your environment: `export OPENAI_API_KEY=sk-your_key_here` in your terminal and restart the app."
+                        warning_visible = True
+                elif selected_mode == "OpenRouter":
+                    if not os.getenv("OPENROUTER_API_KEY"):
+                        warning_value = "OPENROUTER_API_KEY not detected. Please set it in your environment: `export OPENROUTER_API_KEY=your_key_here` in your terminal and restart the app."
+                        warning_visible = True
+                return (
+                    gr.update(visible=selected_mode == "Local"),
+                    gr.update(visible=selected_mode == "HuggingFace"),
+                    gr.update(visible=selected_mode == "OpenAI"),
+                    gr.update(visible=selected_mode == "OpenRouter"),
+                    gr.update(value=warning_value, visible=warning_visible),
+                    gr.State(state_dict),
+                    hf_update,
+                )
+            mode_radio.change(
+                fn=update_mode_visibility,
+                inputs=[mode_radio, session_state],
+                outputs=[local_row, hf_row, openai_row, openrouter_row, warning_md, session_state, hf_model_dropdown],
             )
-        mode_radio.change(
-            fn=update_mode_visibility,
-            inputs=[mode_radio, session_state],
-            outputs=[local_row, hf_row, openai_row, warning_md, session_state],
-        )
-        hf_model_dropdown.change(
-            lambda model, state: (state.value.update({"hf_model_name": model}) or state) if hasattr(state, 'value') else (state.update({"hf_model_name": model}) or state),
-            inputs=[hf_model_dropdown, session_state],
-            outputs=[session_state],
-        )
-        openai_model_dropdown.change(
-            lambda model, state: (state.value.update({"openai_model_name": model}) or state) if hasattr(state, 'value') else (state.update({"openai_model_name": model}) or state),
-            inputs=[openai_model_dropdown, session_state],
-            outputs=[session_state],
-        )
-        scan_dir_button.click(
-            fn=update_model_dropdown,
-            inputs=[models_dir_input],
-            outputs=[folder_dropdown, chatbot],
-        )
-        def confirm_model_handler(selected_folder, state, mode, hf_model, openai_model):
-            if hasattr(state, 'value'):
-                state_dict = state.value
-            else:
-                state_dict = state
-            if mode == "HuggingFace Online":
-                state_dict["hf_model_name"] = hf_model
+            hf_model_dropdown.change(
+                lambda model, state: (state.value.update({"hf_model_name": model}) or state) if hasattr(state, 'value') else (state.update({"hf_model_name": model}) or state),
+                inputs=[hf_model_dropdown, session_state],
+                outputs=[session_state],
+            )
+            openai_model_dropdown.change(
+                lambda model, state: (state.value.update({"openai_model_name": model}) or state) if hasattr(state, 'value') else (state.update({"openai_model_name": model}) or state),
+                inputs=[openai_model_dropdown, session_state],
+                outputs=[session_state],
+            )
+            openrouter_model_text.change(
+                lambda model, state: (state.value.update({"openrouter_model_name": model}) or state) if hasattr(state, 'value') else (state.update({"openrouter_model_name": model}) or state),
+                inputs=[openrouter_model_text, session_state],
+                outputs=[session_state],
+            )
+            scan_dir_button.click(
+                fn=update_model_dropdown,
+                inputs=[models_dir_input],
+                outputs=[folder_dropdown, chatbot],
+            )
+            def confirm_model_handler(selected_folder, state, mode, hf_model, openai_model, openrouter_model):
+                if hasattr(state, 'value'):
+                    state_dict = state.value
+                else:
+                    state_dict = state
+                logger.debug(f"Confirming model for mode: {mode}, selected_folder: {selected_folder}, hf_model: {hf_model}, openai_model: {openai_model}, openrouter_model: {openrouter_model}")
+                if mode == "HuggingFace":
+                    state_dict["hf_model_name"] = hf_model
+                elif mode == "OpenAI":
+                    state_dict["openai_model_name"] = openai_model
+                elif mode == "OpenRouter":
+                    state_dict["openrouter_model_name"] = openrouter_model
                 return finalize_model_selection(selected_folder, gr.State(state_dict), mode)
-            elif mode == "OpenAI":
-                state_dict["openai_model_name"] = openai_model
-                return finalize_model_selection(selected_folder, gr.State(state_dict), mode)
-            else:
-                return finalize_model_selection(selected_folder, gr.State(state_dict), mode)
-        confirm_model_button.click(
-            fn=confirm_model_handler,
-            inputs=[folder_dropdown, session_state, mode_radio, hf_model_dropdown, openai_model_dropdown],
-            outputs=[chatbot, session_state, model_name_display],
+            confirm_model_button.click(
+                fn=confirm_model_handler,
+                inputs=[folder_dropdown, session_state, mode_radio, hf_model_dropdown, openai_model_dropdown, openrouter_model_text],
+                outputs=[chatbot, session_state, model_name_display],
+            )
+            load_button.click(
+                fn=handle_load_button,
+                inputs=[session_state],
+                outputs=[chatbot, session_state],
+            )
+            submit_btn.click(
+                fn=chat_fn,
+                inputs=[msg, chatbot, session_state],
+                outputs=[msg, chatbot, session_state],
+                queue=True,
+            )
+        # INIT GRADIO SERVER LAUNCH INSIDE THREAD
+        demo.launch(
+            server_name="0.0.0.0",
+            server_port=7860,
+            show_error=True,
+            debug=True,
+            inbrowser=True, # AUTO-OPEN BROWSER ON START
+            quiet=True, # TO SUPPRESS LAUNCH PRINTS
         )
-        load_button.click(
-            fn=handle_load_button,
-            inputs=[session_state],
-            outputs=[chatbot, session_state],
-        )
-        submit_btn.click(
-            fn=chat_fn,
-            inputs=[msg, chatbot, session_state],
-            outputs=[msg, chatbot, session_state],
-            queue=True,
-        )
-    demo.launch(server_name="0.0.0.0", server_port=7860, show_error=True, debug=True)
+        # TO SIGNAL LAUNCH COMPLETE
+        launch_event.set()
 
-####
+    try:
+        if not args.cli:
+            # TO START DAEMON THREAD FOR GRADIO IF NOT CLI-ONLY
+            launch_thread = threading.Thread(target=threaded_launch, daemon=True)
+            launch_thread.start()
+            time.sleep(1)  # BRIEF WAIT TO ENSURE SERVER INIT BEFORE LOGGING/CLI START
+            logger.info("Gradio app launched in background thread. Main terminal freed for CLI.")
 
+        # TO RUN CLI LOOP IN MAIN THREAD IMMEDIATELY AFTER OPTIONAL THREAD START
+        cli_loop()  # BLOCKS MAIN THREAD FOR INTERACTIVE CLI; EXITS ON SIGNAL
+    except Exception as e:
+        logger.error(f"Failed to launch Gradio in thread or start CLI: {str(e)}")
+        raise
 
-# LOAD DATABASE WRAPPER - FOR DATABASE LOADING
+# Excerpt from src/gia/GIA.py (complete cli_loop function)
+def cli_loop() -> None:
+    """Main CLI input loop with queue integration."""
+    # TO HANDLE COMMANDS IN MAIN THREAD
+    while True:
+        print("~GIA$ > ", end='', flush=True)
+        cmd = sys.stdin.readline().strip()
+        if cmd:
+            try:
+                result = handle_command(cmd, chat_history=chat_history, is_gradio=False)
+                if isinstance(result, GeneratorType):
+                    output = ''.join(result)  # TO COLLECT CHUNKS WITHOUT EXTRA NEWLINES
+                    print(output, flush=True)
+                else:
+                    print(result, flush=True)
+                print('', flush=True)  # TO ENSURE NEWLINE FOR NEXT PROMPT VISIBILITY IN BUFFERED ENVS
+            except Exception as e:
+                logger.error(f"CLI command error: {e}")
+                print(f"Error: {e}", flush=True)
+        # TO POLL OUTPUT QUEUE NON-BLOCKING (IF USED FOR OTHER OUTPUTS)
+        try:
+            while not output_queue.empty():
+                output = output_queue.get_nowait()
+                print(output, flush=True)
+        except queue.Empty:
+            pass
+
 def load_database_wrapper(state: Dict) -> str:
     """Wrapper for loading database with state validation.
 
@@ -1154,6 +1237,8 @@ def load_database_wrapper(state: Dict) -> str:
     try:
         if app_state.LLM is None:
             mode = state.get("mode", "Local")
+            if mode not in ["Local", "HuggingFace", "OpenAI", "OpenRouter"]:
+                raise ValueError(f"Invalid mode: {mode}")
             config = {"model_path": model_path_gr} if mode == "Local" else {}
             msg, llm = load_llm(mode, config)
             if llm is None:
@@ -1162,7 +1247,6 @@ def load_database_wrapper(state: Dict) -> str:
     except Exception as e:
         raise RuntimeError(f"Model load error during database wrapper: {str(e)}") from e
     return load_database(app_state.LLM)
-
 
 ##############################################################################
 # SIGNAL HANDLER & CLEANUP
@@ -1194,10 +1278,6 @@ def cleanup() -> None:
         print(
             f"{Style.DIM + Fore.LIGHTBLACK_EX}{tag()}No CUDA detected. Cleanup complete.{Style.RESET_ALL}"
         )
-    print(f"{Style.DIM + Fore.LIGHTBLACK_EX}{tag()}Cleanup completed.{Style.RESET_ALL}")
-
-
-##############################################################################
 
 if __name__ == "__main__":
     import signal
@@ -1208,7 +1288,7 @@ if __name__ == "__main__":
         print(f"{dark_gray}{tag()}Starting Gradio application...{reset_style}")
         launch_app()
     except Exception as e:
-        logging.exception(f"Critical error in main application: {e}")
+        logger.exception(f"Critical error in main application: {e}")
         print(f"{tag()}A critical error occurred: {e}. Exiting.")
         traceback.print_exc()
     finally:

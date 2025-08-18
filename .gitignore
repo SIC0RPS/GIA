@@ -47,6 +47,7 @@ model_artifacts/
 
 # Data (raw/processed; often contains PII or large datasets—keep local)
 data/
+MyData/
 datasets/
 *.csv
 *.tsv
@@ -199,7 +200,6 @@ src/gia/plugins/
 # Unwanted/Sensitive Files
 .github/
 
-
 # Any other debug/temp files
 *.bak
 *.swp
@@ -208,6 +208,6 @@ Thumbs.db
 .DS_Store
 pip_constraints.txt
 
-# Allow the db folder but ignore its contents
+# Allow folder but ignore its contents
 !/db/
 db/*
