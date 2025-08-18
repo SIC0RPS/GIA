@@ -1,3 +1,5 @@
+# In state.py (confirmed get_state signature with default to prevent TypeError)
+
 # src/gia/core/state_manager.py
 """State management for GIA project.
 This module provides a singleton StateManager class to manage project-wide state
@@ -6,9 +8,9 @@ that state values can be accessed and modified safely across different modules.
 """
 
 from dataclasses import dataclass, fields
-from typing import Any
+from typing import Any, Optional
 import threading
-from gia.config import CONFIG
+from gia.config import CONFIG, PROJECT_ROOT
 
 @dataclass
 class ProjectState:
@@ -26,16 +28,15 @@ class ProjectState:
     MODEL: Any = None
     TOKENIZER: Any = None
     STREAMER: Any = None
-
+    USE_CHAT: bool = True  # FLAG FOR CHAT VS COMPLETE
 
 def load_state() -> ProjectState:
     """Load or initialize the current project state."""
     state_dict = {
-        f.name: state_manager.get_state(f.name) or f.default
+        f.name: state_manager.get_state(f.name, f.default) or f.default
         for f in fields(ProjectState)
     }
     return ProjectState(**state_dict)
-
 
 class StateManager:
     """Manage project-wide state safely across modules."""
@@ -43,14 +44,14 @@ class StateManager:
     _instance = None
 
     def __new__(cls):
-        # MIL-STYLE TO ENSURE SINGLETON INSTANCE
+        # TO ENSURE SINGLETON INSTANCE
         if cls._instance is None:
             cls._instance = super(StateManager, cls).__new__(cls)
             cls._instance.__init__()
         return cls._instance
 
     def __init__(self):
-        # MIL-STYLE TO INITIALIZE STATE AND LOCK ONCE
+        # TO INITIALIZE STATE AND LOCK ONCE
         if not hasattr(self, "_state"):
             self._state = {
                 "CHROMA_COLLECTION": None,
@@ -65,6 +66,7 @@ class StateManager:
                 "MODEL": None,
                 "TOKENIZER": None,
                 "STREAMER": None,
+                "USE_CHAT": True,
             }
             self._lock = threading.Lock()
 
@@ -75,24 +77,24 @@ class StateManager:
             key (str): The key to set in the state dictionary.
             value (Any): The value to associate with the key.
         """
-        # MIL-STYLE THREAD-SAFE SET OPERATION
+        # TO THREAD-SAFE SET OPERATION
         with self._lock:
             self._state[key] = value
 
-    def get_state(self, key: str) -> Any:
-        """Retrieve a state value.
+    def get_state(self, key: str, default: Optional[Any] = None) -> Any:
+        """Retrieve a state value with optional default.
 
         Args:
             key (str): The key to retrieve from the state dictionary.
+            default (Optional[Any]): Default value if key not found.
 
         Returns:
-            Any: The value associated with the key, or None if not found.
+            Any: The value associated with the key, or default if not found.
         """
-        # MIL-STYLE THREAD-SAFE GET OPERATION
+        # TO THREAD-SAFE GET OPERATION WITH DEFAULT
         with self._lock:
-            return self._state.get(key)
+            return self._state.get(key, default)
 
-
-# MIL-STYLE TO CREATE SINGLETON INSTANCE FOR PROJECT-WIDE USE
+# TO CREATE SINGLETON INSTANCE FOR PROJECT-WIDE USE
 state_manager = StateManager()
 """Global StateManager instance for thread-safe state management across modules."""

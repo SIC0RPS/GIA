@@ -3,12 +3,11 @@ import os
 import sys
 import json
 import time
-import logging
 import gc
 import hashlib
-import queue
-import traceback
-from typing import List, Dict, Optional, Any
+import requests
+import importlib
+from typing import Tuple, Optional, Dict, Any, Type, List
 from datetime import datetime
 from colorama import Fore, Style
 import psutil
@@ -33,8 +32,10 @@ from llama_index.core.vector_stores.types import (
 from transformers import LogitsProcessor, LogitsProcessorList
 from gptqmodel import GPTQModel
 from llama_index.llms.huggingface import HuggingFaceLLM
+
 from llama_index.core import Settings
 
+from huggingface_hub import HfApi
 from gia.core.logger import logger, log_banner
 from gia.config import CONFIG, get_config
 from gia.core.state import state_manager
@@ -57,6 +58,11 @@ DATA_PATH = CONFIG["DATA_PATH"]
 DB_PATH = CONFIG["DB_PATH"]
 DEBUG = CONFIG["DEBUG"]
 DEVICE_MAP = "cuda" if hasattr(os, 'environ') and os.environ.get('CUDA_VISIBLE_DEVICES') else "cpu"
+
+
+from llama_index.llms.huggingface import HuggingFaceLLM
+from llama_index.llms.openai import OpenAI as LlamaOpenAI
+from llama_index.llms.huggingface_api import HuggingFaceInferenceAPI
 
 ###
 
@@ -164,115 +170,20 @@ class PresencePenaltyLogitsProcessor(LogitsProcessor):
 
 global_logits_processor = LogitsProcessorList([PresencePenaltyLogitsProcessor()])
 
+from llama_index.core.llms import LLM, ChatMessage, MessageRole
+from llama_index.llms.openai import OpenAI as LlamaOpenAI
+from llama_index.llms.huggingface import HuggingFaceLLM
 
-def generate(
-    query: str,
-    system_prompt: str,
-    llm: Any,
-    *,
-    max_new_tokens: Optional[int] = None,
-    think: bool = False,
-    depth: int = 0,
-) -> str:
-    """Generate a response using the LLM with OOM handling and performance metrics.
+# In utils.py
+from typing import Optional
+from llama_index.core.llms import LLM, ChatMessage, MessageRole
+from llama_index.llms.openai import OpenAI as LlamaOpenAI
+from llama_index.llms.huggingface import HuggingFaceLLM
 
-    Args:
-        query: The user query string.
-        system_prompt: The system prompt to guide the LLM.
-        llm: The language model instance.
-        max_new_tokens: Optional override for maximum new tokens.
-        think: Flag to enable thinking mode.
-        depth: Recursion depth for OOM retries.
 
-    Returns:
-        Generated response string or error message.
-    """
-    # STEP 1: CHECK RECURSION DEPTH TO PREVENT STACK OVERFLOW
-    if depth > 3:
-        return "Error: Max OOM retry depth exceeded—clear VRAM manually."
-    # STEP 2: PREPARE CHAT MESSAGES WITH CONTROL TAG
-    control_tag = "/think" if think else "/no_think"
-    chat = [
-        ChatMessage(role=MessageRole.SYSTEM, content=system_prompt),
-        ChatMessage(role=MessageRole.SYSTEM, content=control_tag),
-        ChatMessage(role=MessageRole.USER, content=query),
-    ]
-    # STEP 3: OVERRIDE MAX TOKENS IF PROVIDED
-    previous_max = getattr(llm, "max_new_tokens", None)
-    if max_new_tokens is not None:
-        llm.max_new_tokens = max_new_tokens
-    # STEP 4: START TIMING FOR PERFORMANCE METRICS
-    start_time = time.time()  # START TIMING HERE FOR ACCURATE T/S
-    try:
-        # STEP 5: USE NO_GRAD FOR ZERO-COST GRAD-SKIP
-        with torch.no_grad():
-            # STEP 6: USE AUTOCAST BFLOAT16 FOR MIXED PRECISION
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                # STEP 7: SET GLOBAL LOGITS PROCESSOR
-                llm.generate_kwargs["logits_processor"] = global_logits_processor
-                # STEP 8: ENABLE CACHE
-                llm.generate_kwargs["use_cache"] = True
-                # STEP 9: GENERATE NON-STREAMED RESPONSE
-                response = llm.chat(chat, stream=False)
-        # STEP 10: EXTRACT RESPONSE CONTENT SAFELY
-        streamed_text = ""
-        if hasattr(response, "message"):
-            streamed_text = response.message.content
-        else:
-            streamed_text = "Error: empty response"
-        # STEP 11: CALCULATE TOKENS AND T/S POST-GENERATION USING TIKTOKEN
-        try:
-            import tiktoken
-            encoding = tiktoken.get_encoding("cl100k_base")
-            total_tokens = len(encoding.encode(streamed_text))
-        except Exception as e:
-            logger.warning(f"Tiktoken failed: {e} - fallback to word split.")
-            total_tokens = len(streamed_text.split())  # FALLBACK IF TIKTOKEN ISSUES
-        duration = time.time() - start_time
-        tokens_per_sec = total_tokens / duration if duration > 0 else 0
-        # STEP 12: UPDATE STATE FOR RUNNING AVG TPS (THREAD-SAFE VIA STATE_MANAGER)
-        run_count = (state_manager.get_state("run_count") or 0) + 1
-        total_tokens_all = (state_manager.get_state("total_tokens_all") or 0) + total_tokens
-        total_duration_all = (state_manager.get_state("total_duration_all") or 0.0) + duration
-        state_manager.set_state("run_count", run_count)
-        state_manager.set_state("total_tokens_all", total_tokens_all)
-        state_manager.set_state("total_duration_all", total_duration_all)
-        avg_tps = total_tokens_all / total_duration_all if total_duration_all > 0 else 0
-        # STEP 13: LOG METRICS WITH INDUSTRY STANDARD TERMS (TOK/S)
-        logger.info(
-            f"Inference Time: {duration:.2f}s | Tokens: {total_tokens} | Avg TPS: {avg_tps:.2f} tok/s | TPS: {tokens_per_sec:.2f} tok/s"
-        )
-        return streamed_text
-    except torch.cuda.OutOfMemoryError as e:
-        # STEP 14: HANDLE OOM WITH VRAM CLEAR AND RETRY
-        error_msg = (
-            f"Error: OOM during generation - {e}. Reduce max_tokens or clear VRAM."
-        )
-        print(error_msg, flush=True)
-        clear_vram()
-        # STEP 15: HALVE MAX TOKENS FOR RETRY
-        llm.max_new_tokens = (max_new_tokens or MAX_NEW_TOKENS) // 2
-        return generate(
-            query,
-            system_prompt,
-            llm,
-            max_new_tokens=llm.max_new_tokens,
-            think=think,
-            depth=depth + 1,
-        )
-    except Exception as e:
-        # STEP 16: LOG GENERAL ERRORS AND RETURN MESSAGE
-        error_msg = f"Error: Unable to generate response: {e}"
-        print(error_msg, flush=True)
-        return error_msg
-    finally:
-        # STEP 17: RESTORE ORIGINAL MAX TOKENS AND CLEAR VRAM
-        clear_vram()
-        if max_new_tokens is not None and previous_max is not None:
-            llm.max_new_tokens = previous_max
 
-############################################################################################################
 
+####
 
 def _init_embed_model(device: str) -> HuggingFaceEmbedding:
     """Initialize embedding model with shared config.
@@ -295,9 +206,7 @@ def _init_embed_model(device: str) -> HuggingFaceEmbedding:
         embed_model._model = embed_model._model.half()  # FP16 FOR VRAM EFFICIENCY
     return embed_model
 
-
 ####
-
 
 def save_database():
     """Build and persist ChromaDB database with optimized embeddings."""
@@ -404,9 +313,7 @@ def save_database():
         logger.critical(f"Database creation failed: {e}")
         raise
 
-
 ####
-
 
 def load_database(llm: Optional[object] = None) -> str:
     """One-time ChromaDB initializer."""
@@ -476,9 +383,7 @@ def load_database(llm: Optional[object] = None) -> str:
         state_manager.set_state("INDEX", None)
         raise
 
-
 ####
-
 
 def update_database(
     filepaths: list[str] | str,
@@ -562,6 +467,38 @@ def update_database(
     state_manager.set_state("EMBED_MODEL", model)
 
 
+def unload_model() -> str:
+    """Unload the current model and clear resources.
+
+    Returns:
+        str: Status message.
+    """
+    # TO RETRIEVE CURRENT LLM FROM STATE
+    llm = state_manager.get_state("LLM")
+    if llm is None:
+        return "No model loaded to unload."
+    try:
+        # TO HANDLE HUGGINGFACE-SPECIFIC UNLOAD
+        if isinstance(llm, HuggingFaceLLM):
+            if hasattr(llm, "_model"):
+                del llm._model
+            if hasattr(llm, "_tokenizer"):
+                del llm._tokenizer
+            del llm
+            clear_vram()
+        else:
+            # TO HANDLE ONLINE/OTHER LLMS
+            del llm
+            gc.collect()
+        # TO RESET STATE KEYS
+        state_manager.set_state("LLM", None)
+        state_manager.set_state("MODEL_NAME", None)
+        state_manager.set_state("MODEL_PATH", None)
+        return "Model unloaded successfully."
+    except Exception as e:
+        logger.error(f"Unload failed: {e}")
+        return f"Error unloading model: {str(e)}"
+
 ####
 
 def filtered_query_engine(
@@ -603,7 +540,7 @@ def filtered_query_engine(
         retriever = state_manager.get_state("INDEX").as_retriever(
             filters=meta_filters,
             similarity_top_k=2,
-            verbose=logger.isEnabledFor(logging.DEBUG),
+            verbose=logger.isEnabledFor(logger.DEBUG),
         )
 
 
@@ -631,7 +568,7 @@ def filtered_query_engine(
         retriever = state_manager.get_state("INDEX").as_retriever(
             filters=meta_filters,
             similarity_top_k=1,  # FALLBACK TO SMALLER TOP_K ON OOM
-            verbose=logger.isEnabledFor(logging.DEBUG),
+            verbose=logger.isEnabledFor(logger.DEBUG),
         )
         query_engine = RetrieverQueryEngine(
             retriever=retriever,
@@ -662,8 +599,8 @@ def clear_vram() -> None:
                 logger.warning(
                     f"High usage: CPU {cpu_usage}%, RAM {memory_usage}%, GPU {gpu_usage}%—cleared, monitor for leaks."
                 )
-            print(
-                f"{Fore.YELLOW}VRAM cleanup executed—CPU: {cpu_usage}%, RAM: {memory_usage}%, GPU: {gpu_usage}%{Style.RESET_ALL}"
+            logger.info(
+                f"VRAM cleared—CPU: {cpu_usage}%, RAM: {memory_usage}%, GPU: {gpu_usage}%"
             )
             return  # BREAK ON SUCCESS
         except RuntimeError as e:
@@ -679,9 +616,6 @@ def clear_vram() -> None:
         finally:
             # TO RESTORE ORIGINAL BENCHMARK SETTING
             torch.backends.cudnn.benchmark = original_benchmark
-
-###
-
 
 def clear_ram(
     threshold=80,
@@ -699,6 +633,267 @@ def clear_ram(
     else:
         logger.debug(f"RAM at {mem}% < {threshold}%; skipped clear")
 
+def fetch_openai_models() -> list:
+    """Fetch available OpenAI models from the API for dropdown choices, only valid chat/completion models."""
+    valid_models = [
+        "o1", "o1-2024-12-17", "o1-pro", "o1-pro-2025-03-19", "o1-preview", "o1-preview-2024-09-12", "o1-mini", "o1-mini-2024-09-12",
+        "o3-mini", "o3-mini-2025-01-31", "o3", "o3-2025-04-16", "o3-pro", "o3-pro-2025-06-10", "o4-mini", "o4-mini-2025-04-16",
+        "gpt-4", "gpt-4-32k", "gpt-4-1106-preview", "gpt-4-0125-preview", "gpt-4-turbo-preview", "gpt-4-vision-preview", "gpt-4-1106-vision-preview",
+        "gpt-4-turbo-2024-04-09", "gpt-4-turbo", "gpt-4o", "gpt-4o-audio-preview", "gpt-4o-audio-preview-2024-12-17", "gpt-4o-audio-preview-2024-10-01",
+        "gpt-4o-mini-audio-preview", "gpt-4o-mini-audio-preview-2024-12-17", "gpt-4o-2024-05-13", "gpt-4o-2024-08-06", "gpt-4o-2024-11-20",
+        "gpt-4.5-preview", "gpt-4.5-preview-2025-02-27", "chatgpt-4o-latest", "gpt-4o-mini", "gpt-4o-mini-2024-07-18", "gpt-4-0613",
+        "gpt-4-32k-0613", "gpt-4-0314", "gpt-4-32k-0314", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4.1-2025-04-14",
+        "gpt-4.1-mini-2025-04-14", "gpt-4.1-nano-2025-04-14", "gpt-3.5-turbo", "gpt-3.5-turbo-16k", "gpt-3.5-turbo-0125", "gpt-3.5-turbo-1106",
+        "gpt-3.5-turbo-0613", "gpt-3.5-turbo-16k-0613", "gpt-3.5-turbo-0301", "text-davinci-003", "text-davinci-002", "gpt-3.5-turbo-instruct",
+        "text-ada-001", "text-babbage-001", "text-curie-001", "ada", "babbage", "curie", "davinci", "gpt-35-turbo-16k", "gpt-35-turbo",
+        "gpt-35-turbo-0125", "gpt-35-turbo-1106", "gpt-35-turbo-0613", "gpt-35-turbo-16k-0613"
+    ]
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return valid_models
+    try:
+        headers = {"Authorization": f"Bearer {api_key}"}
+        resp = requests.get("https://api.openai.com/v1/models", headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        # Only include valid models present in the API response
+        available = set(m["id"] for m in data.get("data", []))
+        filtered = [m for m in valid_models if m in available]
+        return filtered or valid_models
+    except Exception as e:
+        logger.warning(f"Could not fetch OpenAI models for dropdown: {e}")
+        return valid_models
+
+
+def create_llm(engine: str, model_name: str) -> LLM:
+    """Dynamically create LLM instance based on engine with shared config.
+
+    Args:
+        engine: LLM engine (e.g., 'HuggingFaceLLM', 'LlamaOpenAI').
+        model_name: Model name or path.
+
+    Returns:
+        LLM instance.
+    """
+    mode = engine
+    logger.debug(f"Creating LLM for engine: {engine}, model: {model_name}")
+    if mode == "Local":
+        # TO LOAD LOCAL MODEL WITH GPTQMODEL
+        model_path = model_name
+        pretrained_model = GPTQModel.from_quantized(
+            model_path,
+            device_map=DEVICE_MAP,
+            use_safetensors=True,
+            trust_remote_code=True,
+            inject_fused_attention=False,
+            inject_fused_mlp=False,
+        )
+        tokenizer = pretrained_model.tokenizer
+        # TO SUPPRESS PAD TOKEN WARNING
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        llm = HuggingFaceLLM(
+            model=pretrained_model.model,
+            tokenizer=tokenizer,
+            context_window=CONTEXT_WINDOW,
+            max_new_tokens=MAX_NEW_TOKENS,
+            system_prompt="",  # SET LATER
+            query_wrapper_prompt="",  # SET LATER
+            generate_kwargs={
+                "temperature": TEMPERATURE,
+                "top_p": TOP_P,
+                "top_k": TOP_K,
+                "repetition_penalty": REPETITION_PENALTY,
+                "no_repeat_ngram_size": NO_REPEAT_NGRAM_SIZE,
+                "do_sample": True,
+                "logits_processor": global_logits_processor,
+            },
+            device_map=DEVICE_MAP,
+        )
+        # TO SET GENERATION CONFIG FOR PAD TOKEN
+        llm._model.generation_config.pad_token_id = tokenizer.eos_token_id
+        use_chat = True
+    elif mode == "HuggingFace":
+        llm = HuggingFaceInferenceAPI(
+            model_name=model_name,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_NEW_TOKENS,
+            top_p=TOP_P,
+            api_key=os.getenv("HF_TOKEN"),
+            additional_kwargs={"repetition_penalty": REPETITION_PENALTY},
+        )
+        use_chat = False  # INFERENCE API MODE DISABLED DUE TO VERSION ISSUES WITH OPENAILIKE
+    else:
+        try:
+            module_name = engine.replace("LLM", "").lower()
+            class_name = engine
+            if module_name == "llamaopenai":
+                module_name = "openai"
+                class_name = "OpenAI"
+            if not module_name.startswith(("openai", "huggingface", "anthropic", "groq", "mistralai", "cohere", "bedrock")):
+                raise ValueError(f"Invalid engine module '{module_name}'. Supported patterns: openai*, huggingface*, anthropic, groq, mistralai, cohere, bedrock.")
+            module = importlib.import_module(f"llama_index.llms.{module_name}")
+            llm_class: Type[LLM] = getattr(module, class_name)
+            init_kwargs = {
+                "model": model_name,
+                "temperature": TEMPERATURE,
+                "max_tokens": MAX_NEW_TOKENS,
+                "top_p": TOP_P,
+                "presence_penalty": REPETITION_PENALTY,
+            }
+            init_vars = llm_class.__init__.__code__.co_varnames
+            if "api_key" in init_vars:
+                api_key = os.getenv(f"{class_name.upper()}_API_KEY")
+                if api_key:
+                    init_kwargs["api_key"] = api_key
+            if "token" in init_vars:
+                token = os.getenv("HF_TOKEN") or os.getenv(f"{class_name.upper()}_TOKEN")
+                if token:
+                    init_kwargs["token"] = token
+            if "api_base" in init_vars:
+                init_kwargs["api_base"] = os.getenv("API_BASE", "")
+            llm = llm_class(**init_kwargs)
+            use_chat = True
+            logger.debug(f"Dynamic engine {engine} loaded for {model_name}")
+        except (ImportError, AttributeError, ValueError) as e:
+            logger.debug(f"Dynamic load failed for '{engine}': {e}")
+            raise ValueError(f"Dynamic load failed for '{engine}': {e}") from e
+
+    state_manager.set_state("USE_CHAT", use_chat)
+    logger.debug(f"LLM creation complete; USE_CHAT: {use_chat}")
+    return llm
+
+import contextlib  # TO REDIRECT STDOUT SAFELY DURING MODEL LOAD (FOR CAPTURING GPTQMODEL PRINTS)
+from gia.core.logger import log_file  # TO ACCESS LOG FILE FOR REDIRECTION
+
+def load_llm(mode: str, config: Dict) -> Tuple[str, Optional[Any]]:
+    """Load LLM based on mode with config.
+    Args:
+        mode: "Local", "HuggingFace", "OpenAI", "OpenRouter".
+        config: Dict with "model_path" for local or "model_name" for online.
+    Returns:
+        Tuple[str, Optional[LLM]]: Message and loaded LLM.
+    """
+    logger.debug(f"Loading LLM for mode: {mode} with config: {config}")
+    if mode not in ["Local", "HuggingFace", "OpenAI", "OpenRouter"]:
+        logger.debug(f"Invalid mode: {mode}")
+        return "Invalid mode.", None
+    model_name = config.get("model_name") or config.get("model_path")
+    if not model_name:
+        logger.debug("No model name or path in config")
+        return "No model provided for mode.", None
+    try:
+        # TO REDIRECT GPTQMODEL STDOUT LOGS TO SECONDARY TERMINAL (APP_LOGS.TXT) DURING LOCAL LOAD
+        if mode == "Local":
+            with open(log_file, 'a') as f_log:
+                with contextlib.redirect_stdout(f_log):
+                    llm = create_llm(mode, model_name)
+        else:
+            llm = create_llm(mode, model_name)
+        state_manager.set_state("MODEL_NAME", model_name if mode != "Local" else os.path.basename(model_name))
+        state_manager.set_state("MODEL_PATH", model_name if mode == "Local" else None)
+        logger.debug(f"Load success for {mode}: {model_name}")
+        return f"{mode} model loaded: {model_name}", llm
+    except Exception as e:
+        logger.debug(f"Load failed for {mode}: {str(e)}")
+        return f"Failed to load {mode} model: {str(e)}", None
+
+
+def generate(
+    query: str,
+    system_prompt: str,
+    llm: Any,
+    *,
+    max_new_tokens: Optional[int] = None,
+    think: bool = False,
+    depth: int = 0,
+    **kwargs: Any,
+) -> str:
+    """Generate a response using the LLM with OOM handling and performance metrics."""
+    if depth > 3:
+        return "Error: Max OOM retry depth exceeded—clear VRAM manually."
+    query = query.replace('<', '').replace('>', '').replace('"', '').replace("'", '')
+    control_tag = "/think" if think else "/no_think"
+    full_prompt = f"{system_prompt}\n{control_tag}\n{query}"
+    model_name = kwargs.get("model")
+    engine = kwargs.get("engine")
+    if model_name and engine:
+        try:
+            llm = create_llm(engine, model_name)
+        except Exception as e:
+            logger.warning(f"Dynamic LLM load failed for '{engine}': {e}")
+            return f"Error loading specified model: {str(e)}"
+    previous_max = getattr(llm, "max_new_tokens", None) if hasattr(llm, "max_new_tokens") else None
+    if max_new_tokens is not None and hasattr(llm, "max_new_tokens"):
+        llm.max_new_tokens = max_new_tokens
+    start_time = time.time()
+    try:
+        with torch.no_grad():
+            kwargs_gen = {}
+            if max_new_tokens is not None and isinstance(llm, LlamaOpenAI):
+                kwargs_gen["max_tokens"] = max_new_tokens
+            use_chat = state_manager.get_state("USE_CHAT", True)
+            if use_chat:
+                chat_msgs = [
+                    ChatMessage(role=MessageRole.SYSTEM, content=system_prompt),
+                    ChatMessage(role=MessageRole.SYSTEM, content=control_tag),
+                    ChatMessage(role=MessageRole.USER, content=query),
+                ]
+                response = llm.chat(chat_msgs, **kwargs_gen)
+                streamed_text = response.message.content
+                if not streamed_text.strip():
+                    logger.warning("Empty chat response—falling back to complete.")
+                    response = llm.complete(full_prompt, **kwargs_gen)
+                    streamed_text = response.text
+            else:
+                response = llm.complete(full_prompt, **kwargs_gen)
+                streamed_text = response.text
+            if not streamed_text.strip():
+                logger.warning("Empty response from model—check query, provider limits, or model compatibility.")
+                return "Empty response from model."
+        try:
+            import tiktoken
+            encoding = tiktoken.get_encoding("cl100k_base")
+            total_tokens = len(encoding.encode(streamed_text))
+        except Exception as e:
+            logger.warning(f"Tiktoken failed: {e} - fallback to word split.")
+            total_tokens = len(streamed_text.split())
+        duration = time.time() - start_time
+        tokens_per_sec = total_tokens / duration if duration > 0 else 0
+        run_count = (state_manager.get_state("run_count") or 0) + 1
+        total_tokens_all = (state_manager.get_state("total_tokens_all") or 0) + total_tokens
+        total_duration_all = (state_manager.get_state("total_duration_all") or 0.0) + duration
+        state_manager.set_state("run_count", run_count)
+        state_manager.set_state("total_tokens_all", total_tokens_all)
+        state_manager.set_state("total_duration_all", total_duration_all)
+        avg_tps = total_tokens_all / total_duration_all if total_duration_all > 0 else 0
+        logger.info(
+            f"Inference Time: {duration:.2f}s | Tokens: {total_tokens} | Avg TPS: {avg_tps:.2f} tok/s | TPS: {tokens_per_sec:.2f} tok/s"
+        )
+        return streamed_text.strip()
+    except torch.cuda.OutOfMemoryError as e:
+        logger.warning(f"Error: OOM during generation - {e}. Reduce max_tokens or clear VRAM.")
+        clear_vram()
+        if hasattr(llm, "max_new_tokens"):
+            llm.max_new_tokens = (max_new_tokens or MAX_NEW_TOKENS) // 2
+        return generate(
+            query,
+            system_prompt,
+            llm,
+            max_new_tokens=(llm.max_new_tokens if hasattr(llm, "max_new_tokens") else None),
+            think=think,
+            depth=depth + 1,
+            **kwargs,
+        )
+    except Exception as e:
+        error_msg = f"Error: Unable to generate response: {e}"
+        logger.error(error_msg)
+        return error_msg
+    finally:
+        clear_vram()
+        if max_new_tokens is not None and previous_max is not None and hasattr(llm, "max_new_tokens"):
+            llm.max_new_tokens = previous_max
+
 __all__ = [
     "generate",
     "update_database",
@@ -710,5 +905,8 @@ __all__ = [
     "PresencePenaltyLogitsProcessor", 
     "filtered_query_engine",
     "clear_ram",
-    # ADD OTHERS IF NEEDED
+    "fetch_openai_models",
+    "create_llm",
+    "load_llm",
+    "unload_model",
 ]
