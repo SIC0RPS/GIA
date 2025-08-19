@@ -14,21 +14,55 @@ GIA combines LLMs, RAG, and plugins in Python. Supports CLI and Gradio web UI. D
 
 ## Quick Start
 
-1. **Install Python 3.11+** (CUDA for GPU).
-2. **Install GIA**:
-   ```bash
-   pip install -e . --no-deps --no-build-isolation
-   ```
-3. **Verify install**:
-   ```bash
-   pip show gia
-   pip check
-   ```
-4. **Run GIA**:
-   ```bash
-   python -m gia
-   ```
-   CLI starts. Web UI at http://localhost:7860.
+1. **Create environment**
+
+Option A: Conda
+
+```bash
+conda create -n GIA python=3.11 -y
+conda activate GIA
+```
+
+Option B: venv
+
+```bash
+python3.11 -m venv .venv && source .venv/bin/activate
+```
+
+2. **Install PyTorch (CUDA 12.8 or CPU)**
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install --index-url https://download.pytorch.org/whl/cu128 "torch==2.7.1+cu128"
+# or CPU only:
+python -m pip install torch==2.7.1
+```
+
+3. **Install dependencies + GIA (pip)**
+
+```bash
+pip install -r requirements.lock
+pip install -e .
+```
+
+4. **Install dependencies + GIA (uv)**
+
+```bash
+pip install uv
+uv pip sync requirements.lock
+pip install -e .
+```
+
+5. **Verify + Run**
+
+```bash
+pip show gia
+pip check
+python -m gia
+```
+
+Web UI: [http://localhost:7860](http://localhost:7860)
+
 
 ## Setting API Keys Securely
 

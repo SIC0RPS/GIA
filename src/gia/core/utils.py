@@ -32,6 +32,8 @@ from llama_index.core.vector_stores.types import (
 from transformers import LogitsProcessor, LogitsProcessorList
 from gptqmodel import GPTQModel
 from llama_index.llms.huggingface import HuggingFaceLLM
+from llama_index.llms.openrouter import OpenRouter
+
 
 from llama_index.core import Settings
 
@@ -66,6 +68,7 @@ from llama_index.llms.huggingface_api import HuggingFaceInferenceAPI
 
 ###
 
+# Excerpt from src/gia/core/utils.py (complete append_to_chatbot function)
 def append_to_chatbot(
     history: List[Dict[str, str]],
     message: str,
@@ -116,6 +119,7 @@ def append_to_chatbot(
         logger.error(f"Error in append_to_chatbot: {e}")
         return history
 
+
 ####
 
 
@@ -133,15 +137,25 @@ QA_PROMPT = PromptTemplate(QA_PROMPT_TMPL)
 ####
 
 
-def get_system_info():
-    # CPU usage
+def get_system_info() -> tuple[float, float, list[float]]:
+    """Retrieve system resource usage (CPU, memory, GPU).
+
+    Returns:
+        Tuple of CPU usage (%), memory usage (%), and GPU usage (% list).
+    """
+    # TO GET CPU USAGE
     cpu_usage = psutil.cpu_percent(interval=1)
-    # Memory usage
+    # TO GET MEMORY USAGE
     memory = psutil.virtual_memory()
     memory_usage = memory.percent
-    # GPU usage (for NVIDIA GPUs)
-    gpus = GPUtil.getGPUs()
-    gpu_usage = [gpu.load * 100 for gpu in gpus]
+    # TO GET GPU USAGE WITH FALLBACK
+    gpu_usage = []
+    try:
+        gpus = GPUtil.getGPUs()
+        gpu_usage = [gpu.load * 100 for gpu in gpus]
+    except (ImportError, Exception) as e:
+        logger.warning(f"Failed to get GPU usage (GPUtil unavailable): {e}")
+        gpu_usage = [0.0]  # FALLBACK: Assume no GPU usage
     return cpu_usage, memory_usage, gpu_usage
 
 
@@ -665,6 +679,7 @@ def fetch_openai_models() -> list:
         return valid_models
 
 
+# Excerpt from src/gia/core/utils.py (complete create_llm function)
 def create_llm(engine: str, model_name: str) -> LLM:
     """Dynamically create LLM instance based on engine with shared config.
 
@@ -714,15 +729,40 @@ def create_llm(engine: str, model_name: str) -> LLM:
         llm._model.generation_config.pad_token_id = tokenizer.eos_token_id
         use_chat = True
     elif mode == "HuggingFace":
-        llm = HuggingFaceInferenceAPI(
-            model_name=model_name,
+        try:
+            llm = HuggingFaceInferenceAPI(
+                model_name=model_name,
+                temperature=TEMPERATURE,
+                max_tokens=MAX_NEW_TOKENS,
+                top_p=TOP_P,
+                api_key=os.getenv("HF_TOKEN"),
+                additional_kwargs={"repetition_penalty": REPETITION_PENALTY},
+            )
+            use_chat = False  # INFERENCE API MODE DISABLED DUE TO VERSION ISSUES WITH OPENAILIKE
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                raise ValueError(f"Model '{model_name}' not found or unavailable on Hugging Face Inference API. Valid examples: 'mistralai/Mistral-7B-Instruct-v0.2', 'meta-llama/Llama-2-7b-chat-hf'. Check https://huggingface.co/models for supported models.") from e
+            raise
+    elif mode == "OpenAI":
+        llm = LlamaOpenAI(
+            model=model_name,
             temperature=TEMPERATURE,
             max_tokens=MAX_NEW_TOKENS,
             top_p=TOP_P,
-            api_key=os.getenv("HF_TOKEN"),
-            additional_kwargs={"repetition_penalty": REPETITION_PENALTY},
+            presence_penalty=REPETITION_PENALTY,
+            api_key=os.getenv("OPENAI_API_KEY"),
         )
-        use_chat = False  # INFERENCE API MODE DISABLED DUE TO VERSION ISSUES WITH OPENAILIKE
+        use_chat = True
+    elif mode == "OpenRouter":
+        llm = OpenRouter(
+            model=model_name,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_NEW_TOKENS,
+            top_p=TOP_P,
+            presence_penalty=REPETITION_PENALTY,
+            api_key=os.getenv("OPENROUTER_API_KEY"),
+        )
+        use_chat = True
     else:
         try:
             module_name = engine.replace("LLM", "").lower()
@@ -763,41 +803,32 @@ def create_llm(engine: str, model_name: str) -> LLM:
     logger.debug(f"LLM creation complete; USE_CHAT: {use_chat}")
     return llm
 
+
 import contextlib  # TO REDIRECT STDOUT SAFELY DURING MODEL LOAD (FOR CAPTURING GPTQMODEL PRINTS)
 from gia.core.logger import log_file  # TO ACCESS LOG FILE FOR REDIRECTION
 
-def load_llm(mode: str, config: Dict) -> Tuple[str, Optional[Any]]:
-    """Load LLM based on mode with config.
+# Excerpt from src/gia/core/utils.py (complete load_llm function)
+def load_llm(mode: str, config: Dict) -> Tuple[str, Optional[LLM]]:
+    """Load LLM based on mode and config.
+
     Args:
-        mode: "Local", "HuggingFace", "OpenAI", "OpenRouter".
-        config: Dict with "model_path" for local or "model_name" for online.
+        mode: LLM mode.
+        config: Configuration dict.
+
     Returns:
-        Tuple[str, Optional[LLM]]: Message and loaded LLM.
+        Message and loaded LLM or None.
     """
-    logger.debug(f"Loading LLM for mode: {mode} with config: {config}")
-    if mode not in ["Local", "HuggingFace", "OpenAI", "OpenRouter"]:
-        logger.debug(f"Invalid mode: {mode}")
-        return "Invalid mode.", None
-    model_name = config.get("model_name") or config.get("model_path")
-    if not model_name:
-        logger.debug("No model name or path in config")
-        return "No model provided for mode.", None
     try:
-        # TO REDIRECT GPTQMODEL STDOUT LOGS TO SECONDARY TERMINAL (APP_LOGS.TXT) DURING LOCAL LOAD
-        if mode == "Local":
-            with open(log_file, 'a') as f_log:
-                with contextlib.redirect_stdout(f_log):
-                    llm = create_llm(mode, model_name)
-        else:
-            llm = create_llm(mode, model_name)
-        state_manager.set_state("MODEL_NAME", model_name if mode != "Local" else os.path.basename(model_name))
-        state_manager.set_state("MODEL_PATH", model_name if mode == "Local" else None)
+        logger.debug(f"Loading LLM for mode: {mode} with config: {config}")
+        model_name = config.get("model_name") or config.get("model_path") or MODEL_PATH
+        llm = create_llm(mode, model_name)
+        clear_vram()
         logger.debug(f"Load success for {mode}: {model_name}")
         return f"{mode} model loaded: {model_name}", llm
     except Exception as e:
-        logger.debug(f"Load failed for {mode}: {str(e)}")
-        return f"Failed to load {mode} model: {str(e)}", None
-
+        error_msg = f"Load failed for {mode}: {str(e)}"
+        logger.error(error_msg)
+        return error_msg, None
 
 def generate(
     query: str,

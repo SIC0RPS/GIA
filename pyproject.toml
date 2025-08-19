@@ -6,24 +6,34 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [project]
-name = "gia"
-version = "0.1.0"
-authors = [{name = "SICORPS"}]
-description = "LM Dev module, local LLM."
+name = "GIA"
+version = "0.0.5"
+authors = [{ name = "SICORPS" }]
+description = "Local-first AI assistant with LLM, RAG, and plugins. Supports local GPTQ models, HuggingFace, OpenAI, and OpenRouter APIs."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
+
 dependencies = [
-    "chromadb>=0.5.20",
-    "gptqmodel @ git+https://github.com/ModelCloud/GPTQModel.git@main",
-    "gradio>=5.30.0",
-    "llama-index>=0.12.52",
     "numpy>=2.3.2",
     "torch>=2.7.1",
     "transformers==4.51.2",
+    "gradio>=5.30.0",
+    "chromadb==0.5.20",
+    "gptqmodel @ git+https://github.com/ModelCloud/GPTQModel.git@037c5c0f6c9e33c500d975b038d02e7ca437546d",
+    "llama-index @ git+https://github.com/run-llama/llama_index.git",
+    "llama-index-vector-stores-chroma @ git+https://github.com/run-llama/llama_index.git#subdirectory=llama-index-integrations/vector_stores/llama-index-vector-stores-chroma",
+    "llama-index-llms-huggingface-api @ git+https://github.com/run-llama/llama_index.git#subdirectory=llama-index-integrations/llms/llama-index-llms-huggingface-api",
+    "GPUtil==1.4.0",
+    "llama_index.embeddings.huggingface==0.6.0",
+    "llama-index-llms-huggingface==0.6.0",
+    "scikit-learn==1.7.1",
+    "scipy==1.16.1",
+    "sentence-transformers==5.1.0",
+    "trafilatura==2.0.0",
 ]
+
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -37,23 +47,29 @@ Repository = "https://github.com/SIC0RPS/GIA"
 [project.scripts]
 gia = "gia.__main__:main"
 
+[project.optional-dependencies]
+dev = [
+    "black>=24.10.0",
+    "flake8>=7.1.1",
+]
+
 [tool.black]
 line-length = 88
-target-version = ["py310", "py311", "py312", "py313"]
-include = '\.pyi?$'
-extend-exclude = '''
+target-version = ["py311", "py312", "py313"]
+include = "\\.pyi?$"
+extend-exclude = """
 /(
-    \.git
-  | \.hg
-  | \.mypy_cache
-  | \.tox
-  | \.venv
+    \\.git
+  | \\.hg
+  | \\.mypy_cache
+  | \\.tox
+  | \\.venv
   | _build
   | buck-out
   | build
   | dist
 )/
-'''
+"""
 preview = true
 
 [tool.flake8]
@@ -75,3 +91,6 @@ exclude = [
 ]
 per-file-ignores = "__init__.py:F401"
 max-complexity = 10
+
+[tool.uv.extra-build-dependencies]
+gptqmodel = ["torch"]
