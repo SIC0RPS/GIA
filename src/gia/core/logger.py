@@ -17,6 +17,14 @@ logging.basicConfig(level=logging.WARNING)
 root_logger = logging.getLogger()
 root_logger.propagate = False
 
+def _anonymize_path(msg: str) -> str:
+    """Replace user home directory with './' in logs."""
+    home = os.path.expanduser("~")
+    if home and home in msg:
+        return msg.replace(home, "./")
+    return msg
+
+
 # TO SUPPRESS SPECIFIC THIRD-PARTY LOGGERS
 third_party_loggers = [
     "PIL", "htmldate", "asyncio", "markdown_it", "markdown_it.rules_block", "markdown_it.rules_inline",
@@ -70,10 +78,10 @@ class ColoredFormatter(logging.Formatter):
         if max_length != float('inf') and len(msg) > max_length:
             msg = msg[: max_length - 3] + f"...{Fore.WHITE}]{Style.RESET_ALL}"
         formatted = (
-            f"\n{Fore.WHITE}[{Fore.WHITE}{asctime}{Fore.WHITE}|{Fore.CYAN}{record.levelname}{Fore.WHITE}|"
-            f"{func_color}{func_display}{Fore.WHITE}|{Fore.LIGHTBLACK_EX}{msg}{Fore.WHITE}]{Style.RESET_ALL}\n"
+            f"{Fore.WHITE}[{Fore.WHITE}{asctime}{Fore.WHITE}|{Fore.CYAN}{record.levelname}{Fore.WHITE}|"
+            f"{func_color}{func_display}{Fore.WHITE}|{Fore.LIGHTBLACK_EX}{msg}{Fore.WHITE}]{Style.RESET_ALL}"
         )
-        return formatted
+        return _anonymize_path(formatted)
 
 logger = logging.getLogger("app")
 logger.propagate = True
@@ -149,7 +157,7 @@ class LlamaIndexLoggerHandler(BaseCallbackHandler):
     ) -> None:
         sanitized_payload = self._sanitize_payload(payload)
         self.logger.info(
-            f"[llama-index:{event_type}:{event_id}]\nPayload: {sanitized_payload}"
+            _anonymize_path(f"[llama-index:{event_type}:{event_id}]\nPayload: {sanitized_payload}")
         )
 
     def on_event_end(
@@ -162,7 +170,7 @@ class LlamaIndexLoggerHandler(BaseCallbackHandler):
         if payload:
             sanitized_payload = self._sanitize_payload(payload)
             self.logger.info(
-                f"[llama-index:{event_type}:{event_id}]\nPayload: {sanitized_payload}"
+                _anonymize_path(f"[llama-index:{event_type}:{event_id}]\nPayload: {sanitized_payload}")
             )
 
     def start_trace(self, trace_id: str, **kwargs) -> None:
@@ -178,10 +186,11 @@ except Exception as e:
     logger.exception("Failed to attach LlamaIndexLoggerHandler: %s", e)
 
 def _excepthook(exctype, exc, tb):
-    """Log uncaught exceptions to the file handler."""
-    logger.critical(
-        "UNCAUGHT EXCEPTION:\n%s", "".join(traceback.format_exception(exctype, exc, tb))
+    """Log uncaught exceptions to the file handler with anonymized paths."""
+    trace = "".join(traceback.format_exception(exctype, exc, tb))
+    logger.critical("UNCAUGHT EXCEPTION:\n%s", _anonymize_path(trace)
     )
+
 
 sys.excepthook = _excepthook
 
@@ -195,7 +204,7 @@ except Exception as e:
     logger.error(f"Failed to create log directory {log_dir}: {e}")
     raise
 
-# TO CLEANUP OLD LOG FILES >5MB
+
 if os.path.exists(log_file) and os.path.getsize(log_file) > 5 * 1024 * 1024:
     try:
         os.remove(log_file)  # REMOVE IF EXCEEDS 5MB
@@ -279,7 +288,6 @@ def open_log_terminal():
     except Exception as e:
         logger.error(f"Failed to open log terminal: {e}")
 
-# SETUP SECONDARY LOGGING
 for handler in list(root_logger.handlers):
     if isinstance(handler, logging.StreamHandler):
         root_logger.removeHandler(handler)
