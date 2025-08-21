@@ -177,5 +177,3 @@ def myplugin(llm, query_engine, embed_model, chat_history, arg=None):
 ```
 - Edit file; changes auto-detected.
 - Load only trusted plugins. They run as code with system access.
-
-Personal project. Issues and suggestions welcome via GitHub.

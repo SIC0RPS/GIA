@@ -9,6 +9,7 @@
 *.cert
 *.pfx
 *.p12
+*.txt
 secrets.yaml
 credentials.json
 config/secrets/
@@ -134,7 +135,6 @@ cover/
 *.pot
 
 # Frameworks (Django, Flask, Scrapy)
-*.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
@@ -182,9 +182,8 @@ celerybeat.pid
 *.pt
 *.pth
 logs/
-*.log
 
-### VisualStudioCode ###
+# VisualStudioCode
 .vscode/
 
 # Local History (critical for security—prevents leaking old code versions with secrets)
