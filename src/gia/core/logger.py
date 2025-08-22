@@ -1,4 +1,4 @@
-# src/gia/core/logger.py (complete module with restored functionality)
+# src/gia/core/logger.py
 import sys
 import os
 import logging
@@ -23,7 +23,6 @@ def _anonymize_path(msg: str) -> str:
     if home and home in msg:
         return msg.replace(home, "./")
     return msg
-
 
 # TO SUPPRESS SPECIFIC THIRD-PARTY LOGGERS
 third_party_loggers = [
@@ -66,7 +65,7 @@ class ColoredFormatter(logging.Formatter):
         func_display = record.funcName if record.funcName != "" else record.name
         func_color = self.LEVEL_COLORS.get(record.levelno, Fore.WHITE)
         asctime = self.formatTime(record, "%H:%M:%S")
-        msg = record.getMessage()
+        msg = _anonymize_path(record.getMessage().replace("\n", "\\n"))
         # TO SET DYNAMIC MAX_LENGTH BASED ON LOG LEVEL
         max_length = {
             logging.DEBUG: 5000 if CONFIG["DEBUG"] else 500,
@@ -76,12 +75,33 @@ class ColoredFormatter(logging.Formatter):
             logging.CRITICAL: float('inf'),  # NO TRUNCATION
         }.get(record.levelno, 500)
         if max_length != float('inf') and len(msg) > max_length:
-            msg = msg[: max_length - 3] + f"...{Fore.WHITE}]{Style.RESET_ALL}"
+            msg = msg[: max_length - 3] + "..."
         formatted = (
             f"{Fore.WHITE}[{Fore.WHITE}{asctime}{Fore.WHITE}|{Fore.CYAN}{record.levelname}{Fore.WHITE}|"
             f"{func_color}{func_display}{Fore.WHITE}|{Fore.LIGHTBLACK_EX}{msg}{Fore.WHITE}]{Style.RESET_ALL}"
         )
-        return _anonymize_path(formatted)
+        return formatted
+
+class PlainFormatter(logging.Formatter):
+    """Format log messages without colors, with dynamic length truncation."""
+    def format(self, record):
+        func_display = record.funcName if record.funcName != "" else record.name
+        asctime = self.formatTime(record, "%H:%M:%S")
+        msg = _anonymize_path(record.getMessage().replace("\n", "\\n"))
+        # TO SET DYNAMIC MAX_LENGTH BASED ON LOG LEVEL
+        max_length = {
+            logging.DEBUG: 5000 if CONFIG["DEBUG"] else 500,
+            logging.INFO: 500,
+            logging.WARNING: 500,
+            logging.ERROR: float('inf'),  # NO TRUNCATION
+            logging.CRITICAL: float('inf'),  # NO TRUNCATION
+        }.get(record.levelno, 500)
+        if max_length != float('inf') and len(msg) > max_length:
+            msg = msg[: max_length - 3] + "..."
+        formatted = (
+            f"[{asctime}|{record.levelname}|{func_display}|{msg}]"
+        )
+        return formatted
 
 logger = logging.getLogger("app")
 logger.propagate = True
@@ -205,9 +225,9 @@ except Exception as e:
     raise
 
 
-if os.path.exists(log_file) and os.path.getsize(log_file) > 5 * 1024 * 1024:
+if os.path.exists(log_file):
     try:
-        os.remove(log_file)  # REMOVE IF EXCEEDS 5MB
+        os.remove(log_file)
     except Exception as e:
         logger.error(f"Failed to remove old log file: {e}")
 
@@ -217,6 +237,15 @@ viewer_code = textwrap.dedent('''
     import time
     import os
     import atexit
+    from colorama import Fore, Style, init
+    init(autoreset=False)
+    LEVEL_COLORS = {
+        'DEBUG': Fore.BLUE,
+        'INFO': Fore.GREEN,
+        'WARNING': Fore.YELLOW,
+        'ERROR': Fore.RED,
+        'CRITICAL': Fore.RED,
+    }
     # TO DELETE SELF ON EXIT TO AVOID RACE CONDITION
     atexit.register(lambda: os.unlink(sys.argv[0]) if os.path.exists(sys.argv[0]) else None)
     if len(sys.argv) < 2:
@@ -234,7 +263,20 @@ viewer_code = textwrap.dedent('''
                 if not line:
                     time.sleep(0.1)
                     continue
-                print(line, end="")
+                line = line.rstrip()
+                if line.startswith('[') and line.endswith(']'):
+                    parts = line[1:-1].split('|', 3)
+                    if len(parts) == 4:
+                        asctime, level, func, msg = parts
+                        func_color = LEVEL_COLORS.get(level, Fore.WHITE)
+                        msg = msg.replace('\\\\n', '\\n')
+                        formatted = (
+                            f"{Fore.WHITE}[{Fore.WHITE}{asctime}{Fore.WHITE}|{Fore.CYAN}{level}{Fore.WHITE}|"
+                            f"{func_color}{func}{Fore.WHITE}|{Fore.LIGHTBLACK_EX}{msg}{Fore.WHITE}]{Style.RESET_ALL}"
+                        )
+                        print(formatted)
+                        continue
+                print(line)
     except KeyboardInterrupt:
         print("\\nLog viewer stopped.")
     except Exception as e:
@@ -293,7 +335,7 @@ for handler in list(root_logger.handlers):
         root_logger.removeHandler(handler)
 file_handler = logging.FileHandler(log_file, encoding='utf-8')
 file_handler.addFilter(DeprecationWarningFilter())
-file_handler.setFormatter(ColoredFormatter())
+file_handler.setFormatter(PlainFormatter())
 root_logger.addHandler(file_handler)
 
 for name in third_party_loggers:

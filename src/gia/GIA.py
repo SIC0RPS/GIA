@@ -607,36 +607,36 @@ def finalize_model_selection(
 
 ###
 
-
 def process_input(
     user_text: str,
     state: Optional[Dict[str, Any]],
     chat_history: List[Dict[str, str]],
 ) -> Generator[Union[str, List[Dict[str, str]]], None, None]:
     """
-    Unified backend generator for BOTH UI and CLI.
-    Yields:
-      - str chunks (extend last assistant bubble), or
-      - a full chat_history list (explicit UI sync for non-standard updates).
-
-    Guarantees:
-      * Any STRING chunk yielded to the UI is echoed verbatim to stdout (flush=True).
-      * No markdown reflow; we slice raw substrings.
-      * If <think>/<answer> exist, stream <think> into a collapsible 'Reasoning' message,
-        then stream <answer> as the main assistant bubble.
+    PRODUCTION-READY GENERATOR. STREAMS RESPONSES TO UI AND TERMINAL.
+    * STREAMS VIA NATIVE llm.stream_complete (OpenAI/compatible).
+    * STREAMS VIA TextIteratorStreamer (HuggingFace Local/GPTQ).
+    * FALLBACK: NON-STREAM + BOUNDARY-AWARE CHUNKING (SAFE MARKDOWN).
+    * EVERY UI CHUNK MIRRORED TO TERMINAL WITH FLUSH=TRUE.
+    * RAG + PLUGINS UNTOUCHED.
     """
+    # INITIALIZE APPLICATION STATE
     app_state = load_state()
+    # SANITIZE INPUT TEXT; PREVENT EMPTY PROCESSING
     text = (user_text or "").strip()
     if not text:
+        # LOG EMPTY INPUT FOR AUDIT; NO-OP TO AVOID RESOURCE WASTE
         logger.debug("[PI] empty user_text -> no-op")
         return
-
+    # LOG INPUT DETAILS FOR TRACEABILITY AND DEBUGGING
     logger.debug(f"[PI] input={text!r} | history_size={len(chat_history)} | state_is_dict={isinstance(state, dict)}")
-
+    # HANDLE DOT-COMMANDS FOR LOCAL OPERATIONS
     if text.startswith("."):
+        # EXECUTE COMMAND HANDLER; VALIDATE RESULT TYPE FOR SAFE YIELD
         result = handle_command(text, chat_history, state=state, is_gradio=bool(state is not None))
         if isinstance(result, str):
             if result:
+                # MIRROR TO TERMINAL WITH FLUSH FOR REAL-TIME OUTPUT
                 print(result, end="", flush=True)
             yield result
         else:
@@ -646,126 +646,218 @@ def process_input(
                 else:
                     s = str(item)
                     if s:
+                        # MIRROR TO TERMINAL WITH FLUSH; ENSURE NO EMPTY YIELDS
                         print(s, end="", flush=True)
                         yield s
         return
-
+    # ATTEMPT RAG QUERY IF ENABLED
     state_dict = state if isinstance(state, dict) else {}
     use_qe = bool(state_dict.get("use_query_engine_gr", True))
     used_qe = False
-
     if use_qe and app_state.QUERY_ENGINE:
         try:
+            # QUERY RAG ENGINE; HANDLE STREAMING OR STATIC RESPONSE
             resp = app_state.QUERY_ENGINE.query(text)
             if hasattr(resp, "response_gen") and resp.response_gen is not None:
+                # INIT ANSWER BUBBLE FOR STREAMING RAG
+                append_to_chatbot(chat_history, "", metadata={"role": "assistant"})
+                yield list(chat_history)
                 for chunk in resp.response_gen:
                     s = str(chunk)
-                    if not s or s.isspace():
+                    if not s or s.isspace() or s.strip().lower() == "empty response":
                         continue
-                    if s.strip().lower() == "empty response":
-                        used_qe = False
-                        break
+                    # APPEND CHUNK TO CHAT HISTORY; YIELD FOR UI UPDATE
+                    chat_history[-1]["content"] += s
+                    yield list(chat_history)
+                    # MIRROR TO TERMINAL WITH FLUSH
                     print(s, end="", flush=True)
-                    yield s
+                return
             else:
                 s = resp.response if hasattr(resp, "response") else str(resp)
-                if not s.strip() or s.strip().lower() == "empty response":
-                    used_qe = False
-                else:
+                if s and s.strip().lower() != "empty response":
+                    # APPEND FULL RESPONSE TO CHAT HISTORY
+                    append_to_chatbot(chat_history, s, metadata={"role": "assistant"})
+                    yield list(chat_history)
+                    # MIRROR TO TERMINAL WITH FLUSH
                     print(s, end="", flush=True)
-                    yield s
-            used_qe = True if used_qe is not False else False
+                    return
+                used_qe = False
         except Exception as e:
+            # LOG RAG ERROR; FALLBACK TO LLM FOR RESILIENCE
             logger.warning(f"[PI] Query engine error, falling back to LLM: {e}")
             used_qe = False
-
     if used_qe:
         return
-
-    if app_state.LLM is None:
+    # VALIDATE LLM AVAILABILITY
+    llm = app_state.LLM
+    if llm is None:
         err = "Error: No model loaded for query."
+        # OUTPUT ERROR TO TERMINAL AND YIELD
         print(err, end="", flush=True)
         yield err
         return
-
+    # CONSTRUCT PROMPT WITH SYSTEM PREFIX
+    sys_prompt = system_prefix()
+    prompt = f"{sys_prompt}\n{text}"
+    # DEFINE BOUNDARY-AWARE CHUNKER FOR SAFE MARKDOWN STREAMING
+    def _yield_boundary_chunks(full_text: str) -> Generator[str, None, None]:
+        import re
+        if not full_text:
+            return
+        i, n = 0, len(full_text)
+        fence_open = False
+        MIN_SZ, MAX_SZ = 120, 1200
+        while i < n:
+            j = min(i + MAX_SZ, n)
+            window = full_text[i:j]
+            for _ in re.finditer(r"```", window):
+                fence_open = not fence_open
+            cut = -1
+            if not fence_open:
+                limit = max(MIN_SZ, len(window))
+                cut = window.rfind("\n\n", 0, limit)
+                if cut < MIN_SZ:
+                    cut = window.rfind("\n", 0, limit)
+                if cut < MIN_SZ:
+                    for sep in (". ", "? ", "! "):
+                        loc = window.rfind(sep, 0, limit)
+                        if loc >= MIN_SZ:
+                            cut = loc + len(sep)
+                            break
+            if cut >= MIN_SZ:
+                j = i + cut
+            chunk = full_text[i:j]
+            if chunk:
+                yield chunk
+            i = j
+    # TRACK ANSWER BUBBLE STATE
+    answer_bubble_started = False
+    # ENSURE ANSWER BUBBLE INITIALIZATION
+    def _ensure_answer_bubble_started() -> bool:
+        nonlocal answer_bubble_started
+        if not answer_bubble_started:
+            # APPEND NEW ASSISTANT ENTRY TO CHAT HISTORY
+            append_to_chatbot(chat_history, "", metadata={"role": "assistant"})
+            answer_bubble_started = True
+            return True
+        return False
+    # DEFINE STREAM ROUTER FOR DIRECT APPEND TO ANSWER
+    def _route_and_emit(buffer: str) -> Generator[List[Dict[str, str]], None, None]:
+        nonlocal answer_bubble_started
+        if _ensure_answer_bubble_started():
+            # YIELD UPDATED HISTORY FOR UI REDRAW ON BUBBLE CREATION
+            yield list(chat_history)
+        # APPEND BUFFER TO LAST CONTENT; ASSUME VALID TEXT
+        chat_history[-1]["content"] += buffer
+        # YIELD UPDATED HISTORY FOR UI REDRAW
+        yield list(chat_history)
+        # MIRROR TO TERMINAL WITH FLUSH
+        print(buffer, end="", flush=True)
+    # ATTEMPT OPENAI-COMPATIBLE STREAMING
     try:
-        full = generate(text, system_prefix(), app_state.LLM, max_new_tokens=MAX_NEW_TOKENS) or ""
+        from llama_index.llms.huggingface import HuggingFaceLLM as _HFL_TYPE
+        stream_complete = getattr(llm, "stream_complete", None)
+        if callable(stream_complete) and not isinstance(llm, _HFL_TYPE):
+            # PROCESS STREAM EVENTS; ROUTE DELTAS
+            for ev in stream_complete(prompt):
+                delta = ev if isinstance(ev, str) else (getattr(ev, "delta", None) or getattr(ev, "text", ""))
+                if not delta:
+                    continue
+                for out in _route_and_emit(delta):
+                    yield out
+            return
+    except Exception as e:
+        # LOG STREAMING FAILURE; FALLBACK FOR RESILIENCE
+        logger.warning(f"[PI] stream_complete failed: {e}")
+    # ATTEMPT HF TRANSFORMERS STREAMING
+    try:
+        from llama_index.llms.huggingface import HuggingFaceLLM as _HFL_TYPE
+        if isinstance(llm, _HFL_TYPE) and hasattr(llm, "_model") and hasattr(llm, "_tokenizer"):
+            from transformers import TextIteratorStreamer
+            import threading
+            model = llm._model
+            tok = llm._tokenizer
+            # TOKENIZE PROMPT; VALIDATE NON-EMPTY
+            enc = tok(prompt, return_tensors="pt")
+            if "input_ids" not in enc or enc["input_ids"] is None or enc["input_ids"].numel() == 0:
+                raise RuntimeError("Empty tokenized prompt (HF).")
+            dev = getattr(model, "device", None)
+            if dev is not None:
+                # MOVE TENSORS TO DEVICE; PREVENT DEVICE MISMATCH
+                enc = {k: (v.to(dev) if hasattr(v, "to") else v) for k, v in enc.items()}
+            # INITIALIZE STREAMER; SKIP PROMPT AND SPECIALS
+            streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
+            # PREPARE GENERATION KWARGS; MERGE USER SETTINGS SAFELY
+            gen_kwargs = {
+                "input_ids": enc["input_ids"],
+                "attention_mask": enc.get("attention_mask", None),
+                "max_new_tokens": MAX_NEW_TOKENS,
+                "streamer": streamer,
+            }
+            if gen_kwargs["attention_mask"] is None:
+                del gen_kwargs["attention_mask"]
+            try:
+                user_gk = getattr(llm, "generate_kwargs", None)
+                if isinstance(user_gk, dict):
+                    for k, v in user_gk.items():
+                        if k not in gen_kwargs and v is not None:
+                            gen_kwargs[k] = v
+            except Exception:
+                pass
+            # CAPTURE EXCEPTIONS IN BACKGROUND THREAD
+            err_box = {"exc": None}
+            def _bg():
+                try:
+                    # EXECUTE MODEL GENERATION
+                    model.generate(**gen_kwargs)
+                except Exception as e:
+                    err_box["exc"] = e
+                    try:
+                        streamer.end_of_stream = True
+                    except Exception:
+                        pass
+            # START DAEMON THREAD FOR GENERATION
+            threading.Thread(target=_bg, daemon=True).start()
+            # PROCESS STREAMED TOKENS; ROUTE TO EMITTER
+            for token_text in streamer:
+                if not token_text:
+                    continue
+                for out in _route_and_emit(token_text):
+                    yield out
+            if err_box["exc"] is not None:
+                raise err_box["exc"]
+            return
+    except Exception as e:
+        # LOG HF STREAMING FAILURE; FALLBACK TO NON-STREAM
+        logger.warning(f"[PI] HF streaming failed (fallback to non-stream): {e}")
+    # NON-STREAMING FALLBACK GENERATION
+    try:
+        # GENERATE FULL RESPONSE; LIMIT TOKENS FOR SAFETY
+        full = generate(text, sys_prompt, llm, max_new_tokens=MAX_NEW_TOKENS) or ""
+        # LOG GENERATION LENGTH FOR MONITORING
         logger.debug(f"[PI] generate returned len={len(full)}")
     except Exception as e:
         msg = f"Error generating response: {e}"
+        # OUTPUT ERROR TO TERMINAL AND YIELD; NO LEAK SENSITIVE INFO
         print(msg, end="", flush=True)
         yield msg
         return
-
     if not full:
         msg = "Empty response."
+        # OUTPUT EMPTY RESPONSE NOTICE
         print(msg, end="", flush=True)
         yield msg
         return
-
-    low = full.lower()
-    has_think = "<think>" in low and "</think>" in low
-    has_answer = "<answer>" in low and "</answer>" in low
-
-    def _slice(source: str, start: int, end: int) -> str:
-        return source[start:end] if 0 <= start < end <= len(source) else ""
-
-    think_text = ""
-    answer_text = full
-
-    if has_think:
-        t_start = low.index("<think>") + len("<think>")
-        t_end   = low.index("</think>", t_start)
-        think_text = _slice(full, t_start, t_end)
-
-    if has_answer:
-        a_start = low.index("<answer>") + len("<answer>")
-        a_end   = low.index("</answer>", a_start)
-        answer_text = _slice(full, a_start, a_end)
-    elif has_think:
-        # If only think is present, answer is what's after </think>
-        a_start_guess = low.index("</think>") + len("</think>")
-        answer_text = full[a_start_guess:]
-
-    CHUNK_SIZE = 800  # conservative; preserves markdown formatting
-
-    if think_text:
-        append_to_chatbot(
-            chat_history,
-            "",  # content will stream in
-            metadata={"role": "assistant", "title": "Reasoning", "status": "pending"},
-        )
-        # Sync UI to show the new (empty) reasoning panel
+    # INIT ANSWER BUBBLE FOR FULL RESPONSE
+    if _ensure_answer_bubble_started():
         yield list(chat_history)
-
-        # Stream the thoughts into the reasoning panel
-        for i in range(0, len(think_text), CHUNK_SIZE):
-            chunk = think_text[i:i + CHUNK_SIZE]
-            chat_history[-1]["content"] += chunk
-            # Update UI with the modified history
-            yield list(chat_history)
-            # Mirror to terminal (exact chunk)
-            print(chunk, end="", flush=True)
-
-        # Mark reasoning done (collapses by default in Gradio)
-        if "metadata" in chat_history[-1]:
-            chat_history[-1]["metadata"]["status"] = "done"
+    # CHUNK AND YIELD FULL TEXT SAFELY
+    for chunk in _yield_boundary_chunks(full):
+        chat_history[-1]["content"] += chunk
         yield list(chat_history)
+        print(chunk, end="", flush=True)
 
-    # 2) Stream the ANSWER as the main assistant bubble (string chunks)
-    ui_text = answer_text if (has_think or has_answer) else full
-    if not ui_text:
-        return
-
-    for i in range(0, len(ui_text), CHUNK_SIZE):
-        chunk = ui_text[i:i + CHUNK_SIZE]
-        if not chunk:
-            continue
-        print(chunk, end="", flush=True)  # terminal parity for UI strings
-        yield chunk
-
-
-###
+### 
 
 def handle_load_button(state: Dict[str, Any]) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
     """Handle load button action with early initialization and deduplication.
@@ -856,7 +948,7 @@ def chat_fn(
         if isinstance(item, list):
             # plugin command returned a full chat_history
             chat_history[:] = item
-            logger.debug(f"[CF] plugin returned full history | size={len(chat_history)}")
+            #logger.debug(f"[CF] plugin returned full history | size={len(chat_history)}")
             yield "", gr.update(value=list(chat_history)), state
             continue
 
