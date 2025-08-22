@@ -22,14 +22,14 @@ DEFAULT_SYSTEM_PROMPT = "You are an expert assistant. Provide accurate, reliable
 MODEL_PATH = "~/models/quantized"
 EMBED_MODEL_PATH = "~/models/bge-large-en-v1.5"
 DATA_PATH = "MyData"        # RELATIVE TO PROJECT_ROOT/src/gia
-DB_PATH = "db"              # RELATIVE TO PROJECT_ROOT/src/gia
-RULES_PATH = "db/rules.json"  # RELATIVE TO PROJECT_ROOT/src/gia
+DB_PATH = "db"              
+RULES_PATH = "db/rules.json"  
 
 # LOAD ENVIRONMENT VARIABLES FROM .env IF AVAILABLE (NON-FATAL ON FAILURE)
 try:
     import dotenv  # type: ignore
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(override=False) # Do not override existing environment variables
 except ImportError:
     print("Warning: python-dotenv not installed; skipping .env loading.")
 except FileNotFoundError as e:
