@@ -9,6 +9,7 @@ import subprocess
 import time
 import tempfile
 import atexit
+import inspect  # TO SUPPORT FUNCTION SIGNATURE EXTRACTION FOR DEBUG LOGS
 from colorama import Fore, Style
 from gia.config import PROJECT_ROOT, CONFIG
 
@@ -18,21 +19,35 @@ root_logger = logging.getLogger()
 root_logger.propagate = False
 
 def _anonymize_path(msg: str) -> str:
-    """Replace user home directory with './' in logs."""
+    """Replace user home directory with './' in logs without extra '/'."""
     home = os.path.expanduser("~")
     if home and home in msg:
-        return msg.replace(home, "./")
+        # TO REPLACE HOME + SEP WITH './' TO AVOID DOUBLE '/'
+        msg = msg.replace(home + os.sep, './')
+        msg = msg.replace(home, './')  # FALLBACK FOR NON-PATH CASES
     return msg
 
-# TO SUPPRESS SPECIFIC THIRD-PARTY LOGGERS
+# TO SUPPRESS SPECIFIC THIRD-PARTY LOGGERS (EXCEPT HTTPX FOR DETAILED LOGS)
 third_party_loggers = [
     "PIL", "htmldate", "asyncio", "markdown_it", "markdown_it.rules_block", "markdown_it.rules_inline",
-    "httpx", "httpcore", "urllib3.connectionpool", "gradio"
+    "httpcore", "urllib3.connectionpool", "gradio"
 ]
 for name in third_party_loggers:
     logger_obj = logging.getLogger(name)
     logger_obj.setLevel(logging.WARNING)
     logger_obj.propagate = False
+
+# SPECIAL SETUP FOR HTTPX TO SHOW DETAILED HTTP REQUESTS IN DEBUG MODE (WITH 'ONLINE' PREFIX IF APPLICABLE)
+httpx_logger = logging.getLogger("httpx")
+httpx_logger.setLevel(logging.DEBUG if CONFIG["DEBUG"] else logging.WARNING)
+httpx_logger.propagate = False
+class HttpxFilter(logging.Filter):
+    """Add 'ONLINE' prefix to httpx logs for HTTP requests."""
+    def filter(self, record):
+        if "Sending request" in record.getMessage() or "Received response" in record.getMessage():
+            record.msg = f"ONLINE {record.msg}"
+        return True
+httpx_logger.addFilter(HttpxFilter())
 
 # TO FILTER DEPRECATION AND DEPENDENCY WARNINGS
 class DeprecationWarningFilter(logging.Filter):
@@ -51,6 +66,31 @@ class DeprecationWarningFilter(logging.Filter):
                 return False
         return True
 
+# TO ADD FUNCTION SIGNATURE TO DEBUG LOGS IN DEBUG MODE
+class SignatureFilter(logging.Filter):
+    """Attach function signature to LogRecord for DEBUG level in DEBUG mode."""
+    def filter(self, record):
+        if CONFIG["DEBUG"]:
+            try:
+                frame = sys._getframe(3)  # GET CALLER FRAME (SKIPPING LOGGING STACK)
+                func = frame.f_code
+                sig = inspect.signature(func)
+                # TO FORMAT SIGNATURE AS (param1, param2, etc) WITH VARARGS HANDLING
+                params = []
+                for param in sig.parameters.values():
+                    if param.kind == inspect.Parameter.VAR_POSITIONAL:
+                        params.append(f'*{param.name}')
+                    elif param.kind == inspect.Parameter.VAR_KEYWORD:
+                        params.append(f'**{param.name}')
+                    else:
+                        params.append(str(param).split('=')[0])  # OMIT DEFAULTS FOR BREVITY
+                record.signature = f'({", ".join(params)})'
+            except Exception:
+                record.signature = ''
+        else:
+            record.signature = ''
+        return True
+
 class ColoredFormatter(logging.Formatter):
     """Format log messages with dynamic length and color based on level."""
     LEVEL_COLORS = {
@@ -63,14 +103,22 @@ class ColoredFormatter(logging.Formatter):
 
     def format(self, record):
         func_display = record.funcName if record.funcName != "" else record.name
+        # TO APPEND SIGNATURE IF AVAILABLE
+        if hasattr(record, 'signature') and record.signature:
+            func_display += record.signature
         func_color = self.LEVEL_COLORS.get(record.levelno, Fore.WHITE)
         asctime = self.formatTime(record, "%H:%M:%S")
         msg = _anonymize_path(record.getMessage().replace("\n", "\\n"))
-        # TO SET DYNAMIC MAX_LENGTH BASED ON LOG LEVEL
+        # TO INCLUDE FULL TRACEBACK FOR WARNING/ERROR/CRITICAL IN DEBUG MODE
+        if CONFIG["DEBUG"] and record.exc_info and record.levelno >= logging.WARNING:
+            exc_text = self.formatException(record.exc_info)
+            exc_text = _anonymize_path(exc_text)
+            msg += f"\n{exc_text}"
+        # TO SET DYNAMIC MAX_LENGTH BASED ON LOG LEVEL (NO TRUNCATION FOR WARNING IN DEBUG)
         max_length = {
             logging.DEBUG: 5000 if CONFIG["DEBUG"] else 500,
             logging.INFO: 500,
-            logging.WARNING: 500,
+            logging.WARNING: float('inf') if CONFIG["DEBUG"] else 500,
             logging.ERROR: float('inf'),  # NO TRUNCATION
             logging.CRITICAL: float('inf'),  # NO TRUNCATION
         }.get(record.levelno, 500)
@@ -86,13 +134,21 @@ class PlainFormatter(logging.Formatter):
     """Format log messages without colors, with dynamic length truncation."""
     def format(self, record):
         func_display = record.funcName if record.funcName != "" else record.name
+        # TO APPEND SIGNATURE IF AVAILABLE
+        if hasattr(record, 'signature') and record.signature:
+            func_display += record.signature
         asctime = self.formatTime(record, "%H:%M:%S")
         msg = _anonymize_path(record.getMessage().replace("\n", "\\n"))
-        # TO SET DYNAMIC MAX_LENGTH BASED ON LOG LEVEL
+        # TO INCLUDE FULL TRACEBACK FOR WARNING/ERROR/CRITICAL IN DEBUG MODE
+        if CONFIG["DEBUG"] and record.exc_info and record.levelno >= logging.WARNING:
+            exc_text = self.formatException(record.exc_info)
+            exc_text = _anonymize_path(exc_text)
+            msg += f"\n{exc_text}"
+        # TO SET DYNAMIC MAX_LENGTH BASED ON LOG LEVEL (NO TRUNCATION FOR WARNING IN DEBUG)
         max_length = {
             logging.DEBUG: 5000 if CONFIG["DEBUG"] else 500,
             logging.INFO: 500,
-            logging.WARNING: 500,
+            logging.WARNING: float('inf') if CONFIG["DEBUG"] else 500,
             logging.ERROR: float('inf'),  # NO TRUNCATION
             logging.CRITICAL: float('inf'),  # NO TRUNCATION
         }.get(record.levelno, 500)
@@ -208,9 +264,7 @@ except Exception as e:
 def _excepthook(exctype, exc, tb):
     """Log uncaught exceptions to the file handler with anonymized paths."""
     trace = "".join(traceback.format_exception(exctype, exc, tb))
-    logger.critical("UNCAUGHT EXCEPTION:\n%s", _anonymize_path(trace)
-    )
-
+    logger.critical("UNCAUGHT EXCEPTION:\n%s", _anonymize_path(trace))
 
 sys.excepthook = _excepthook
 
@@ -223,8 +277,6 @@ try:
 except Exception as e:
     logger.error(f"Failed to create log directory {log_dir}: {e}")
     raise
-
-
 if os.path.exists(log_file):
     try:
         os.remove(log_file)
@@ -268,10 +320,11 @@ viewer_code = textwrap.dedent('''
                     parts = line[1:-1].split('|', 3)
                     if len(parts) == 4:
                         asctime, level, func, msg = parts
-                        func_color = LEVEL_COLORS.get(level, Fore.WHITE)
+                        level_color = LEVEL_COLORS.get(level, Fore.CYAN)  # COLOR LEVEL BY ITS COLOR
+                        func_color = LEVEL_COLORS.get(level, Fore.WHITE)  # COLOR FUNC BY LEVEL FOR CONSISTENCY
                         msg = msg.replace('\\\\n', '\\n')
                         formatted = (
-                            f"{Fore.WHITE}[{Fore.WHITE}{asctime}{Fore.WHITE}|{Fore.CYAN}{level}{Fore.WHITE}|"
+                            f"{Fore.WHITE}[{Fore.WHITE}{asctime}{Fore.WHITE}|{level_color}{level}{Fore.WHITE}|"
                             f"{func_color}{func}{Fore.WHITE}|{Fore.LIGHTBLACK_EX}{msg}{Fore.WHITE}]{Style.RESET_ALL}"
                         )
                         print(formatted)
@@ -335,16 +388,14 @@ for handler in list(root_logger.handlers):
         root_logger.removeHandler(handler)
 file_handler = logging.FileHandler(log_file, encoding='utf-8')
 file_handler.addFilter(DeprecationWarningFilter())
+file_handler.addFilter(SignatureFilter())  # ADD SIGNATURE FILTER FOR ALL LOGS IN DEBUG MODE
 file_handler.setFormatter(PlainFormatter())
 root_logger.addHandler(file_handler)
-
 for name in third_party_loggers:
     logging.getLogger(name).addHandler(file_handler)
-
 gptq_logger = logging.getLogger("gptqmodel")
 gptq_logger.setLevel(logging.DEBUG if CONFIG["DEBUG"] else logging.INFO)
 gptq_logger.propagate = False
 gptq_logger.addHandler(file_handler)
-
 if CONFIG["DEBUG"]:
     open_log_terminal()
