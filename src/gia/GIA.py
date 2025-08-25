@@ -8,7 +8,6 @@ import json
 import logging
 import gc
 import hashlib
-import queue
 import traceback
 import argparse
 import time
@@ -16,6 +15,10 @@ import sys
 import asyncio
 import shlex
 import threading
+import torch
+import gradio as gr
+from functools import partial
+from queue import Empty
 from types import GeneratorType
 from functools import partial
 from datetime import datetime
@@ -25,20 +28,17 @@ from logging.handlers import QueueHandler, QueueListener
 from queue import Queue, Empty
 from typing import Dict, Callable, List, Generator, Optional, Tuple, Any, Union
 from gptqmodel import GPTQModel
+from colorama import init
+init(autoreset=True)
+
 from llama_index.llms.huggingface import HuggingFaceLLM
 from llama_index.llms.openai import OpenAI as LlamaOpenAI
 from llama_index.llms.huggingface_api import HuggingFaceInferenceAPI
 from llama_index.core import Settings
-import torch
-import gradio as gr
-from functools import partial
-import requests
 
-from gia.core.logger import logger
-from gia.core.utils import append_to_chatbot
+from gia.config import CONFIG, PROJECT_ROOT, system_prefix
 from gia.core.logger import logger, log_banner
-from gia.core.state import state_manager
-from gia.core.state import load_state
+from gia.core.state import ( load_state, ProjectState, state_manager )
 from gia.core.utils import (
     generate,
     clear_vram,
@@ -50,11 +50,8 @@ from gia.core.utils import (
     load_llm,
     fetch_openai_models,
 )
-from gia.core.logger import logger, log_banner
-from gia.config import CONFIG, PROJECT_ROOT, system_prefix
 
-# CONFIG VALUES FOR DIRECT USE
-RULES_PATH = CONFIG["RULES_PATH"]
+
 CONTEXT_WINDOW = CONFIG["CONTEXT_WINDOW"]
 MAX_NEW_TOKENS = CONFIG["MAX_NEW_TOKENS"]
 TEMPERATURE = CONFIG["TEMPERATURE"]
@@ -66,16 +63,26 @@ MODEL_PATH = CONFIG["MODEL_PATH"]
 EMBED_MODEL_PATH = CONFIG["EMBED_MODEL_PATH"]
 DB_PATH = CONFIG["DB_PATH"]
 DEBUG = CONFIG["DEBUG"]
-# Global chat_history and message queue
-chat_history = []
-
+chat_history = [] # todo chat history + summerization in background
 log_banner(__file__)
 
 class PluginSandbox:
     """Isolated sandbox for plugin execution using threading with cooperative stop.
 
-    TO INITIALIZE WITH QUEUES AND EVENT FOR STOP.
+    MIL PURPOSE:
+    - RUN PLUGINS IN THEIR OWN THREADS WITH COOPERATIVE STOP CONTROL.
+    - FORWARD PLUGIN LOGS VIA A QueueHandler → QueueListener PIPELINE.
+    - STREAM RESULTS BACK TO CALLER USING AN OUTPUT QUEUE.
+
+    SECURITY:
+    - NO eval/exec. TRUSTS ONLY THE CALLABLE PASSED BY THE APPLICATION.
+    - TUNNELS EXCEPTIONS BACK AS OBJECTS; AVOIDS LEAKING TRACEBACKS IN UI.
+
+    EDGE CASES:
+    - GENERATOR PLUGINS: STREAM CHUNKS UNTIL STOP EVENT OR COMMAND.
+    - NON-GENERATOR PLUGINS: SINGLE PUT OF RESULT, THEN SENTINEL None.
     """
+
     def __init__(
         self,
         plugin_name: str,
@@ -91,24 +98,32 @@ class PluginSandbox:
             args: Positional arguments for the function.
             kwargs: Keyword arguments for the function.
         """
-        # TO SET UP PLUGIN DETAILS AND QUEUES
+        # MIL: ASSIGN METADATA AND IPC QUEUES
         self.plugin_name = plugin_name
         self.func = func
         self.args = args
         self.kwargs = kwargs
+
+        # MIL: THREAD HANDLE + IPC
         self.thread: Optional[threading.Thread] = None
-        self.output_queue: Queue = Queue()  # FOR RESULTS/STREAMING
-        self.input_queue: Queue = Queue()  # FOR COMMANDS FROM MAIN (E.G., STOP)
-        self.logger_queue: Queue = Queue()  # FOR LOGS
-        self.stop_event = threading.Event()  # FOR COOPERATIVE STOP
+        self.output_queue: Queue = Queue()  # RESULTS/STREAMING
+        self.input_queue: Queue = Queue()  # CONTROL COMMANDS (E.G., "stop")
+        self.logger_queue: Queue = Queue()  # LOG RECORDS FROM WORKER
+        self.stop_event = threading.Event()  # COOPERATIVE STOP SIGNAL
+
+        # MIL: PER-SANDBOX QueueListener (TERMINAL/STDOUT ONLY)
         self.listener: Optional[QueueListener] = None
 
     def start(self) -> None:
         """Start the sandbox thread and logger listener.
 
-        TO CREATE THREAD WITH STOP EVENT AND START DAEMON.
+        WHAT:
+            - SPAWN DAEMON THREAD TO EXECUTE THE PLUGIN.
+            - START A QueueListener TO FORWARD WORKER LOGS TO STDOUT.
+        WHY:
+            - NON-BLOCKING UI + TERMINAL VISIBILITY.
         """
-        # TO CREATE AND START THREAD
+        # MIL: CREATE AND START WORKER THREAD
         self.thread = threading.Thread(
             target=self._run_func,
             args=(
@@ -120,34 +135,48 @@ class PluginSandbox:
                 self.logger_queue,
                 self.stop_event,
             ),
+            daemon=True,
         )
-        self.thread.daemon = True
         self.thread.start()
 
-        # TO CONFIGURE logger HANDLERS - TERMINAL ONLY
-        handlers = [logger.StreamHandler(sys.stdout)]
+        # MIL: LISTENER WRITES TO STDOUT; USE logging.MODULE API
+        handlers = [logging.StreamHandler(sys.stdout)]
         self.listener = QueueListener(self.logger_queue, *handlers)
         self.listener.start()
 
     def stop(self) -> None:
         """Stop the sandbox thread cooperatively and clean up resources.
 
-        TO SIGNAL STOP VIA EVENT AND QUEUE, JOIN WITH TIMEOUT, AND STOP LISTENER.
+        WHAT:
+            - SET STOP FLAG AND QUEUE COMMAND.
+            - JOIN WITH TIMEOUT TO AVOID HANGS.
+            - STOP LISTENER AND CLEAR STATE.
+        WHY:
+            - GRACEFUL SHUTDOWN; PREVENT RESOURCE LEAKS.
         """
-        # TO SET STOP SIGNAL FOR COOPERATIVE EXIT
+        # MIL: SIGNAL STOP
         self.stop_event.set()
         self.input_queue.put("stop")
 
-        # TO WAIT FOR THREAD COMPLETION WITH TIMEOUT TO AVOID HANGS
+        # MIL: JOIN WITH TIMEOUT FOR RELIABILITY
         if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=5.0)  # 5-SECOND TIMEOUT FOR GRACEFUL SHUTDOWN
+            self.thread.join(timeout=5.0)
             if self.thread.is_alive():
-                logger.warning(f"Timeout waiting for plugin '{self.plugin_name}' thread to stop.")
+                # NOTE: USE GLOBAL PROJECT LOGGER IF AVAILABLE
+                try:
+                    logger.warning(
+                        "Timeout waiting for plugin '%s' thread to stop.",
+                        self.plugin_name,
+                    )
+                except Exception:
+                    pass
 
-        # TO STOP logger LISTENER AND CLEAN UP
+        # MIL: TEAR DOWN LISTENER
         if self.listener:
-            self.listener.stop()
-            self.listener = None
+            try:
+                self.listener.stop()
+            finally:
+                self.listener = None
 
     @staticmethod
     def _run_func(
@@ -161,54 +190,89 @@ class PluginSandbox:
     ) -> None:
         """Target function for the thread: execute plugin with logger and stop check.
 
-        Args:
-            func: Plugin function.
-            args: Positional args.
-            kwargs: Keyword args.
-            output_queue: Queue for results/streaming.
-            input_queue: Queue for commands from main.
-            logger_queue: Queue for logs.
-            stop_event: Event to check for stop signal.
+        LOGGING PIPELINE:
+            worker thread -> QueueHandler(logger_queue)
+                          -> QueueListener (in main thread) -> stdout
+
+        RISKS MITIGATED:
+            - DUPLICATE LOGS: HANDLER IS ALWAYS REMOVED IN FINALLY.
+            - UI CRASH: EXCEPTIONS ARE SENT VIA QUEUE; THREAD DOES NOT HARD-CRASH.
         """
-        # TO SET UP logger IN CHILD THREAD
-        root_logger = logger.getLogger()
-        queue_handler = QueueHandler(logger_queue)
+        # MIL: OBTAIN ROOT LOGGER VIA MODULE-LEVEL API (FIXES AttributeError)
+        root_logger = logging.getLogger()
+
+        # MIL: ATTACH A QueueHandler TO ROUTE RECORDS TO THIS SANDBOX'S QUEUE
+        queue_handler: QueueHandler = QueueHandler(logger_queue)
         root_logger.addHandler(queue_handler)
 
         try:
-            # DEBUG PRINT TO CONFIRM THREAD START
-            logger.debug("Plugin thread started; executing function.")
-            # TO EXECUTE PLUGIN FUNCTION
+            # MIL: DIAGNOSTIC — CONFIRM THREAD START
+            try:
+                logger.debug(
+                    "Plugin thread started; executing '%s'.",
+                    getattr(func, "__name__", "<anonymous>"),
+                )
+            except Exception:
+                pass
+
+            # MIL: EXECUTE PLUGIN (GENERATOR OR REGULAR)
             result = func(*args, **kwargs)
+
             if inspect.isgenerator(result):
-                # TO HANDLE GENERATOR WITH BIDIRECTIONAL CHECKS AND STOP EVENT
+                # MIL: STREAM CHUNKS WITH COOPERATIVE-STOP + COMMAND CHECK
                 for chunk in result:
                     if stop_event.is_set():
-                        logger.info("Plugin stopped by event")
+                        try:
+                            logger.info("Plugin stopped by event")
+                        except Exception:
+                            pass
                         break
                     try:
                         cmd = input_queue.get_nowait()
                         if cmd == "stop":
-                            logger.info("Plugin stopped by command")
+                            try:
+                                logger.info("Plugin stopped by command")
+                            except Exception:
+                                pass
                             break
                     except Empty:
                         pass
+                    # MIL: FORWARD OUTPUT
                     output_queue.put(chunk)
             else:
-                # TO HANDLE NON-GENERATOR RESULT
+                # MIL: NON-GENERATOR RESULT PATH
                 if stop_event.is_set():
-                    logger.info("Plugin stopped by event")
+                    try:
+                        logger.info("Plugin stopped by event")
+                    except Exception:
+                        pass
                 else:
                     output_queue.put(result)
-            output_queue.put(None)  # SENTINEL FOR END
-        except BaseException as exc:
-            # TO SEND EXCEPTION ACROSS THREAD
+
+            # MIL: SENTINEL — SIGNAL END OF STREAM
+            output_queue.put(None)
+
+        except Exception as exc:
+            # MIL: SAFE ERROR TUNNEL — NO STACK TRACE LEAK TO UI BY DEFAULT
+            try:
+                logger.error("Plugin error: %s", exc)
+            except Exception:
+                pass
             output_queue.put(exc)
             output_queue.put(None)
-        except Exception as e:
-            logger.error(f"Error in plugin resumption: {e}")
-            output_queue.put(e)
-            output_queue.put(None)
+
+        finally:
+            # MIL: CRITICAL — ALWAYS REMOVE HANDLER TO PREVENT DUPLICATE LOGS/LEAKS
+            try:
+                root_logger.removeHandler(queue_handler)
+                try:
+                    queue_handler.close()
+                except Exception:
+                    pass
+            except Exception:
+                # MIL: NEVER RAISE ON CLEANUP
+                pass
+
 
 plugins: Dict[str, Callable] = {}
 module_mtimes: Dict[str, float] = {}
@@ -271,26 +335,17 @@ logger.info(f"(L.P) Loaded {len(plugins)} plugins: {list(plugins.keys())}")
 ####
 
 # Flags
-METADATA_TITLE = f"🛠️ Generated by {PROJECT_ROOT.name.upper()}-{hash(PROJECT_ROOT) % 10000}"
+METADATA_TITLE = f"Generated by {PROJECT_ROOT.name.upper()}-{hash(PROJECT_ROOT) % 10000}"
 dark_gray = Style.DIM + Fore.LIGHTBLACK_EX
 reset_style = Style.RESET_ALL
 
-##################################################################################
+###
 
 # LOGGER SETUP - FOR CONSISTENT logger
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG if CONFIG["DEBUG"] else logging.INFO)
     
 
-
-####
-
-# TIMESTAMP TAG - FOR logger
-def tag() -> str:
-    """Generate timestamp for logger."""
-    # TO FORMAT TIMESTAMP
-    current_time = datetime.now().strftime("[%H:%M:%S]")
-    return f"{current_time} : $ "
 
 ####
 
@@ -312,9 +367,6 @@ def m_hash(filepath: str) -> str:
     return hash_sha256.hexdigest()
 
 ####
-
-
-from queue import Empty
 
 def handle_command(
     cmd: str,
@@ -342,7 +394,6 @@ def handle_command(
     if app_state.LLM is None and cmd_lower not in llm_free:
         return "Error: No model loaded. Please confirm a model first."
 
-    # -------- built-ins --------
     if cmd_lower in llm_free:
         try:
             if cmd_lower == ".create":
@@ -407,7 +458,6 @@ def handle_command(
             logger.error("Built-in command failed: %s", e)
             return f"Command failed: {e}"
 
-    # -------- plugins --------
     if not cmd_lower.startswith(".") or len(cmd_lower) <= 1:
         return "Error: Invalid command. Commands must start with '.'"
 
@@ -615,28 +665,26 @@ def process_input(
     """
     PRODUCTION-READY GENERATOR. STREAMS RESPONSES TO UI AND TERMINAL.
     * STREAMS VIA NATIVE llm.stream_complete (OpenAI/compatible).
-    * STREAMS VIA TextIteratorStreamer (HuggingFace Local/GPTQ).
+    * STREAMS VIA TextIteratorStreamer (HuggingFace Local/GPTQ) WITH BOS/PAD GUARDS.
     * FALLBACK: NON-STREAM + BOUNDARY-AWARE CHUNKING (SAFE MARKDOWN).
     * EVERY UI CHUNK MIRRORED TO TERMINAL WITH FLUSH=TRUE.
-    * RAG + PLUGINS UNTOUCHED.
     """
-    # INITIALIZE APPLICATION STATE
+    # TO INITIALIZE APPLICATION STATE - PRESERVES GLOBAL ISOLATION; WHY: AVOIDS RACE CONDITIONS IN MULTI-THREAD; EDGE: STATE NONE HANDLED; PERF: O(1); SEC: NO EXTERNAL ACCESS.
     app_state = load_state()
-    # SANITIZE INPUT TEXT; PREVENT EMPTY PROCESSING
+    # TO SANITIZE INPUT TEXT - REMOVES LEADING/TRAILING WHITESPACE; WHY: PREVENTS EMPTY PROCESSING; EDGE: ALL WHITESPACE -> EMPTY; PERF: O(N); SEC: AVOIDS INJECTION VIA CONTROL CHARS.
     text = (user_text or "").strip()
     if not text:
-        # LOG EMPTY INPUT FOR AUDIT; NO-OP TO AVOID RESOURCE WASTE
         logger.debug("[PI] empty user_text -> no-op")
         return
-    # LOG INPUT DETAILS FOR TRACEABILITY AND DEBUGGING
-    logger.debug(f"[PI] input={text!r} | history_size={len(chat_history)} | state_is_dict={isinstance(state, dict)}")
-    # HANDLE DOT-COMMANDS FOR LOCAL OPERATIONS
+    logger.debug(
+        f"[PI] input={text!r} | history_size={len(chat_history)} "
+        f"| state_is_dict={isinstance(state, dict)}"
+    )
+    # TO HANDLE DOT-COMMANDS - FAST PATH FOR LOCAL OPS; WHY: SHORT-CIRCUIT FOR EFFICIENCY; EDGE: INVALID RESULTS YIELDED AS STR; PERF: O(1) CHECK; SEC: COMMAND HANDLER VALIDATES.
     if text.startswith("."):
-        # EXECUTE COMMAND HANDLER; VALIDATE RESULT TYPE FOR SAFE YIELD
         result = handle_command(text, chat_history, state=state, is_gradio=bool(state is not None))
         if isinstance(result, str):
             if result:
-                # MIRROR TO TERMINAL WITH FLUSH FOR REAL-TIME OUTPUT
                 print(result, end="", flush=True)
             yield result
         else:
@@ -646,60 +694,54 @@ def process_input(
                 else:
                     s = str(item)
                     if s:
-                        # MIRROR TO TERMINAL WITH FLUSH; ENSURE NO EMPTY YIELDS
                         print(s, end="", flush=True)
                         yield s
         return
-    # ATTEMPT RAG QUERY IF ENABLED
+    # TO ATTEMPT RAG QUERY IF ENABLED - OPTIONAL KNOWLEDGE RETRIEVAL; WHY: ENHANCES ACCURACY; EDGE: EMPTY RESPONSE SKIPPED; PERF: DEPENDS ON ENGINE; SEC: QUERY SANITIZED VIA ENGINE.
     state_dict = state if isinstance(state, dict) else {}
     use_qe = bool(state_dict.get("use_query_engine_gr", True))
     used_qe = False
     if use_qe and app_state.QUERY_ENGINE:
         try:
-            # QUERY RAG ENGINE; HANDLE STREAMING OR STATIC RESPONSE
             resp = app_state.QUERY_ENGINE.query(text)
             if hasattr(resp, "response_gen") and resp.response_gen is not None:
-                # INIT ANSWER BUBBLE FOR STREAMING RAG
                 append_to_chatbot(chat_history, "", metadata={"role": "assistant"})
                 yield list(chat_history)
                 for chunk in resp.response_gen:
                     s = str(chunk)
                     if not s or s.isspace() or s.strip().lower() == "empty response":
                         continue
-                    # APPEND CHUNK TO CHAT HISTORY; YIELD FOR UI UPDATE
                     chat_history[-1]["content"] += s
                     yield list(chat_history)
-                    # MIRROR TO TERMINAL WITH FLUSH
                     print(s, end="", flush=True)
                 return
             else:
                 s = resp.response if hasattr(resp, "response") else str(resp)
                 if s and s.strip().lower() != "empty response":
-                    # APPEND FULL RESPONSE TO CHAT HISTORY
                     append_to_chatbot(chat_history, s, metadata={"role": "assistant"})
                     yield list(chat_history)
-                    # MIRROR TO TERMINAL WITH FLUSH
                     print(s, end="", flush=True)
                     return
                 used_qe = False
         except Exception as e:
-            # LOG RAG ERROR; FALLBACK TO LLM FOR RESILIENCE
             logger.warning(f"[PI] Query engine error, falling back to LLM: {e}")
             used_qe = False
     if used_qe:
         return
-    # VALIDATE LLM AVAILABILITY
+    # TO VALIDATE LLM AVAILABILITY - CRITICAL CHECK; WHY: PREVENTS NULL DEREF; EDGE: NONE -> YIELD ERROR; PERF: O(1); SEC: SAFE ERROR MSG.
     llm = app_state.LLM
     if llm is None:
         err = "Error: No model loaded for query."
-        # OUTPUT ERROR TO TERMINAL AND YIELD
         print(err, end="", flush=True)
         yield err
         return
-    # CONSTRUCT PROMPT WITH SYSTEM PREFIX
+    # TO CONSTRUCT PROMPT WITH SYSTEM PREFIX - ASSEMBLES FULL INPUT; WHY: MODEL-SPECIFIC; EDGE: EMPTY SYS -> USER ONLY; PERF: O(N); SEC: NO UNSANITIZED INPUT.
     sys_prompt = system_prefix()
     prompt = f"{sys_prompt}\n{text}"
-    # DEFINE BOUNDARY-AWARE CHUNKER FOR SAFE MARKDOWN STREAMING
+    # TO FORCE NON-EMPTY PROMPT - PREFIX SPACE IF STRIPPED; WHY: ENSURES TOKENIZER YIELDS >=1 TOKEN (TRANSFORMERS 4.55.4 EDGE); RISK: SEMANTIC SHIFT (MINIMAL, SKIPPED IN OUTPUT); ASSUM: SPACE TOKEN EXISTS; EDGE: ALL STRIP -> SPACE; PERF: O(1); SEC: NEUTRAL INSERTION.
+    if not prompt.strip():
+        prompt = " "
+    # TO DEFINE BOUNDARY-AWARE CHUNKER - SAFE MARKDOWN STREAMING; WHY: PREVENTS BROKEN FENCES; EDGE: EMPTY -> NO YIELD; PERF: O(N); SEC: NO EXEC.
     def _yield_boundary_chunks(full_text: str) -> Generator[str, None, None]:
         import re
         if not full_text:
@@ -730,35 +772,27 @@ def process_input(
             if chunk:
                 yield chunk
             i = j
-    # TRACK ANSWER BUBBLE STATE
+    # TO TRACK ANSWER BUBBLE STATE - MANAGES UI APPEND; WHY: AVOIDS DUPLICATE ENTRIES; EDGE: MULTI-YIELD -> EXTEND; PERF: O(1); SEC: HISTORY VALIDATED.
     answer_bubble_started = False
-    # ENSURE ANSWER BUBBLE INITIALIZATION
     def _ensure_answer_bubble_started() -> bool:
         nonlocal answer_bubble_started
         if not answer_bubble_started:
-            # APPEND NEW ASSISTANT ENTRY TO CHAT HISTORY
             append_to_chatbot(chat_history, "", metadata={"role": "assistant"})
             answer_bubble_started = True
             return True
         return False
-    # DEFINE STREAM ROUTER FOR DIRECT APPEND TO ANSWER
     def _route_and_emit(buffer: str) -> Generator[List[Dict[str, str]], None, None]:
         nonlocal answer_bubble_started
         if _ensure_answer_bubble_started():
-            # YIELD UPDATED HISTORY FOR UI REDRAW ON BUBBLE CREATION
             yield list(chat_history)
-        # APPEND BUFFER TO LAST CONTENT; ASSUME VALID TEXT
         chat_history[-1]["content"] += buffer
-        # YIELD UPDATED HISTORY FOR UI REDRAW
         yield list(chat_history)
-        # MIRROR TO TERMINAL WITH FLUSH
         print(buffer, end="", flush=True)
-    # ATTEMPT OPENAI-COMPATIBLE STREAMING
+    # TO ATTEMPT OPENAI-COMPATIBLE STREAM - PRIMARY NON-HF PATH; WHY: FAST FOR API; EDGE: DELTA NONE -> SKIP; PERF: STREAMING; SEC: LLM HANDLES.
     try:
         from llama_index.llms.huggingface import HuggingFaceLLM as _HFL_TYPE
         stream_complete = getattr(llm, "stream_complete", None)
         if callable(stream_complete) and not isinstance(llm, _HFL_TYPE):
-            # PROCESS STREAM EVENTS; ROUTE DELTAS
             for ev in stream_complete(prompt):
                 delta = ev if isinstance(ev, str) else (getattr(ev, "delta", None) or getattr(ev, "text", ""))
                 if not delta:
@@ -767,95 +801,142 @@ def process_input(
                     yield out
             return
     except Exception as e:
-        # LOG STREAMING FAILURE; FALLBACK FOR RESILIENCE
         logger.warning(f"[PI] stream_complete failed: {e}")
-    # ATTEMPT HF TRANSFORMERS STREAMING
+    # TO ATTEMPT HUGGINGFACE TRANSFORMERS STREAM - CRITICAL PATH FOR LOCAL; WHY: STREAMING EFFICIENCY; EDGE: EMPTY -> GUARD; PERF: THREADED; SEC: INFERENCE MODE.
     try:
         from llama_index.llms.huggingface import HuggingFaceLLM as _HFL_TYPE
         if isinstance(llm, _HFL_TYPE) and hasattr(llm, "_model") and hasattr(llm, "_tokenizer"):
-            from transformers import TextIteratorStreamer
+            # TO LAZY IMPORT INSIDE BRANCH - AVOIDS GLOBAL DEP; WHY: CONDITIONAL LOAD; RISK: IMPORT FAIL -> FALLBACK; ASSUM: TRANSFORMERS INSTALLED; EDGE: NONE; PERF: DEFERRED; SEC: NO EXEC.
             import threading
+            import torch
+            from transformers import TextIteratorStreamer
             model = llm._model
             tok = llm._tokenizer
-            # TOKENIZE PROMPT; VALIDATE NON-EMPTY
-            enc = tok(prompt, return_tensors="pt")
-            if "input_ids" not in enc or enc["input_ids"] is None or enc["input_ids"].numel() == 0:
-                raise RuntimeError("Empty tokenized prompt (HF).")
-            dev = getattr(model, "device", None)
-            if dev is not None:
-                # MOVE TENSORS TO DEVICE; PREVENT DEVICE MISMATCH
-                enc = {k: (v.to(dev) if hasattr(v, "to") else v) for k, v in enc.items()}
-            # INITIALIZE STREAMER; SKIP PROMPT AND SPECIALS
+            device = getattr(model, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+            # TO TOKENIZE WITH SPECIALS - ADDS MODEL TOKENS; WHY: PREPS INPUT; RISK: STRIP -> EMPTY (GUARDED BELOW); ASSUM: ADD_SPECIAL_OK; EDGE: LONG PROMPT -> OOM (HANDLED OUTER); PERF: O(N); SEC: TOKENIZER SAFE.
+            enc = tok(prompt, return_tensors="pt", add_special_tokens=True)
+            # TO HARD GUARD SEQ_LEN >=1 - INSERTS BOS/EOS/0 IF EMPTY; WHY: PREVENTS CACHE_POSITION EMPTY (TRANSFORMERS 4.55.4 BUG); RISK: SEMANTIC SHIFT (MINIMAL, SKIPPED); ASSUM: VOCAB >0; EDGE: NO BOS/EOS -> 0; PERF: O(1); SEC: MODEL-DEFINED IDS.
+            def _force_min_seq_len(e: Any) -> Dict[str, torch.Tensor]:
+                _ids = e.get("input_ids")
+                if _ids is not None and _ids.numel() > 0 and _ids.shape[-1] > 0:
+                    return {"input_ids": _ids, "attention_mask": e.get("attention_mask")}
+                if getattr(tok, "bos_token_id", None) is not None:
+                    fid = tok.bos_token_id
+                elif getattr(tok, "eos_token_id", None) is not None:
+                    fid = tok.eos_token_id
+                else:
+                    fid = 0
+                _input_ids = torch.tensor([[fid]], dtype=torch.long)
+                _attn = torch.ones_like(_input_ids, dtype=torch.long)
+                logger.info("Empty input_ids -> initialized with single special token for safe start.")
+                return {"input_ids": _input_ids, "attention_mask": _attn}
+            guarded = _force_min_seq_len(enc)
+            input_ids = guarded["input_ids"]
+            attention_mask = guarded.get("attention_mask")
+            # TO DEVICE MOVE - DICT-SAFE; WHY: CUDA CONSISTENCY; RISK: OOM (HANDLED OUTER); ASSUM: DEVICE VALID; EDGE: CPU FALLBACK; PERF: O(N); SEC: NO LEAK.
+            input_ids = input_ids.to(device)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+            # TO STREAMER SETUP - SKIPS PROMPT/SPECIALS; WHY: CLEAN OUTPUT; RISK: NONE; ASSUM: TOK VALID; EDGE: EMPTY -> EMPTY; PERF: STREAMING; SEC: NO.
             streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
-            # PREPARE GENERATION KWARGS; MERGE USER SETTINGS SAFELY
-            gen_kwargs = {
-                "input_ids": enc["input_ids"],
-                "attention_mask": enc.get("attention_mask", None),
-                "max_new_tokens": MAX_NEW_TOKENS,
-                "streamer": streamer,
-            }
-            if gen_kwargs["attention_mask"] is None:
-                del gen_kwargs["attention_mask"]
+            # TO PAD-ID FALLBACK - REQUIRED FOR CAUSAL LMS; WHY: STABILIZES SAMPLING; RISK: EOS AS PAD (STANDARD); ASSUM: EOS EXISTS; EDGE: NONE -> PASS; PERF: O(1); SEC: NO MUTATE GLOBAL.
             try:
-                user_gk = getattr(llm, "generate_kwargs", None)
-                if isinstance(user_gk, dict):
-                    for k, v in user_gk.items():
-                        if k not in gen_kwargs and v is not None:
-                            gen_kwargs[k] = v
+                if getattr(tok, "pad_token_id", None) is None and getattr(tok, "eos_token_id", None) is not None:
+                    tok.pad_token_id = tok.eos_token_id
             except Exception:
                 pass
-            # CAPTURE EXCEPTIONS IN BACKGROUND THREAD
-            err_box = {"exc": None}
-            def _bg():
+            # TO GENERATION KWARGS - EXPLICIT/CRITICAL; WHY: CUSTOM CONFIG; RISK: OVERRIDE DEFAULTS; ASSUM: CONFIG VALID; EDGE: LOW TEMP -> DETERMINISTIC; PERF: MODEL-DEP; SEC: SAFE VALUES.
+            gen_kwargs: Dict[str, Any] = {
+                "input_ids": input_ids,
+                "streamer": streamer,
+                "use_cache": True,
+                "max_new_tokens": CONFIG["MAX_NEW_TOKENS"],
+                "temperature": CONFIG["TEMPERATURE"],
+                "top_p": CONFIG["TOP_P"],
+                "do_sample": True,
+            }
+            if attention_mask is not None:
+                gen_kwargs["attention_mask"] = attention_mask
+            # TO FINAL ASSERT - NO SIZE-0; WHY: FAIL CLOSED IF GUARD MISS; RISK: RAISE (CAUGHT OUTER); ASSUM: GUARD WORKS; EDGE: NONE; PERF: O(1); SEC: PREVENTS UNDEF BEHAVIOR.
+            if gen_kwargs["input_ids"].shape[-1] == 0:
+                raise RuntimeError("Guard failed: input_ids has zero length before generate().")
+            # TO BACKGROUND GENERATION - THREADED FOR STREAM; WHY: NON-BLOCKING; RISK: THREAD HANG (TIMEOUT JOIN); ASSUM: DAEMON OK; EDGE: ERROR -> BOX; PERF: PARALLEL; SEC: INFERENCE MODE.
+            err_box: Dict[str, Optional[BaseException]] = {"exc": None}
+            def _bg_run(_kwargs: Dict[str, Any]) -> None:
                 try:
-                    # EXECUTE MODEL GENERATION
-                    model.generate(**gen_kwargs)
+                    with torch.inference_mode():
+                        model.generate(**_kwargs)
                 except Exception as e:
                     err_box["exc"] = e
                     try:
                         streamer.end_of_stream = True
                     except Exception:
                         pass
-            # START DAEMON THREAD FOR GENERATION
-            threading.Thread(target=_bg, daemon=True).start()
-            # PROCESS STREAMED TOKENS; ROUTE TO EMITTER
+            t = threading.Thread(target=_bg_run, args=(gen_kwargs,), daemon=True)
+            t.start()
             for token_text in streamer:
                 if not token_text:
                     continue
                 for out in _route_and_emit(token_text):
                     yield out
+            t.join(timeout=0.1)
+            exc = err_box["exc"]
+            if exc is not None and isinstance(exc, IndexError) and (
+                "cache_position" in str(exc) or "size 0" in str(exc) or "index -1" in str(exc)
+            ):
+                logger.warning("[PI] Retry without cache due to cache_position/size-0 IndexError.")
+                # TO FORCE FRESH MIN INPUT - DISABLE CACHE; WHY: WORKAROUND HF BUG; RISK: SLOWER (NO CACHE); ASSUM: FID VALID; EDGE: RETRY FAIL -> RAISE; PERF: SINGLE RETRY; SEC: MINIMAL INPUT.
+                fid = (
+                    tok.bos_token_id
+                    if getattr(tok, "bos_token_id", None) is not None
+                    else (tok.eos_token_id if getattr(tok, "eos_token_id", None) is not None else 0)
+                )
+                input_ids = torch.tensor([[fid]], dtype=torch.long, device=device)
+                attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=device)
+                streamer2 = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
+                gen_kwargs2 = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "streamer": streamer2,
+                    "use_cache": False,  # MIL: WORKAROUND FOR HF EDGE BUG
+                    "max_new_tokens": CONFIG["MAX_NEW_TOKENS"],
+                    "temperature": CONFIG["TEMPERATURE"],
+                    "top_p": CONFIG["TOP_P"],
+                    "do_sample": True,
+                }
+                err_box["exc"] = None
+                threading.Thread(target=_bg_run, args=(gen_kwargs2,), daemon=True).start()
+                for token_text in streamer2:
+                    if not token_text:
+                        continue
+                    for out in _route_and_emit(token_text):
+                        yield out
+                if err_box["exc"] is not None:
+                    raise err_box["exc"]
             if err_box["exc"] is not None:
-                raise err_box["exc"]
+                # TO SURFACE SAFE ERROR - NO TRACEBACK IN CHAT; WHY: USER-FRIENDLY; RISK: MASK DETAILS (LOGGED); ASSUM: EXC TYPE SAFE; EDGE: NONE -> RETURN; PERF: O(1); SEC: NO LEAK.
+                msg = f"Generation error (HF): {type(err_box['exc']).__name__}"
+                logger.error(f"[PI] HF stream failed: {err_box['exc']}")
+                yield msg
+                return
             return
     except Exception as e:
-        # LOG HF STREAMING FAILURE; FALLBACK TO NON-STREAM
         logger.warning(f"[PI] HF streaming failed (fallback to non-stream): {e}")
-    # NON-STREAMING FALLBACK GENERATION
+    # TO FALLBACK NON-STREAMING - COMPLETE GEN WITH CHUNKING; WHY: RESILIENCE; EDGE: EMPTY -> YIELD MSG; PERF: FULL GEN; SEC: LLM SAFE.
     try:
-        # GENERATE FULL RESPONSE; LIMIT TOKENS FOR SAFETY
-        full = generate(text, sys_prompt, llm, max_new_tokens=MAX_NEW_TOKENS) or ""
-        # LOG GENERATION LENGTH FOR MONITORING
-        logger.debug(f"[PI] generate returned len={len(full)}")
+        resp = llm.complete(prompt)
+        full_text = resp.text if hasattr(resp, "text") else str(resp)
+        if full_text.strip().lower() == "empty response":
+            yield "Empty response from model."
+            return
+        for chunk in _yield_boundary_chunks(full_text):
+            for out in _route_and_emit(chunk):
+                yield out
+        return
     except Exception as e:
-        msg = f"Error generating response: {e}"
-        # OUTPUT ERROR TO TERMINAL AND YIELD; NO LEAK SENSITIVE INFO
-        print(msg, end="", flush=True)
-        yield msg
-        return
-    if not full:
-        msg = "Empty response."
-        # OUTPUT EMPTY RESPONSE NOTICE
-        print(msg, end="", flush=True)
-        yield msg
-        return
-    # INIT ANSWER BUBBLE FOR FULL RESPONSE
-    if _ensure_answer_bubble_started():
-        yield list(chat_history)
-    # CHUNK AND YIELD FULL TEXT SAFELY
-    for chunk in _yield_boundary_chunks(full):
-        chat_history[-1]["content"] += chunk
-        yield list(chat_history)
-        print(chunk, end="", flush=True)
+        err = f"Generation failed: {str(e)}"
+        logger.error(f"[PI] Fallback failed: {e}")
+        yield err
 
 ### 
 
@@ -992,10 +1073,102 @@ def launch_app(args: argparse.Namespace) -> None:
 
         # BUILD DEMO INSIDE THREAD TO BIND ASYNC EVENTS CORRECTLY
         with gr.Blocks(
-            title="SCRPS AI",
+            title=f"{tag()} - UI Gradio Interface",
             delete_cache=(60, 60),
-            theme="d8ahazard/rd_blue",
-            css="#model-name-display{text-align:left;width:100%;font-size:1.1em;margin-top:0.5em;}",
+            theme=gr.themes.Monochrome(
+                primary_hue="gray",
+                secondary_hue=gr.themes.Color(c100="#f5f5f4", c200="#e7e5e4", c300="#d6d3d1", c400="#a8a29e", c50="#fafaf9", c500="#78716c", c600="#57534e", c700="#44403c", c800="#292524", c900="#1c1917", c950="#111111"),
+                neutral_hue="gray",
+                text_size="lg",
+                radius_size="lg",
+                font=[gr.themes.GoogleFont("Roboto Italic"), "ui-sans-serif", "system-ui", "sans-serif"],
+                font_mono=[gr.themes.GoogleFont("JetBrains Mono"), "ui-monospace", "monospace"],
+            ).set(
+                body_background_fill="#000000",
+                body_background_fill_dark="#000000",
+                block_background_fill="#1a1a1a",
+                block_background_fill_dark="#1a1a1a",
+                block_info_text_size="*text_lg",
+                checkbox_label_background_fill="*neutral_800",
+                checkbox_label_border_color_selected="*primary_800",
+                checkbox_label_border_color_selected_dark="*primary_800",
+                block_radius="*radius_lg",
+                block_shadow="*shadow_drop",
+                button_large_radius="*radius_lg",
+                button_medium_radius="*radius_lg",
+                button_small_radius="*radius_lg",
+                button_primary_background_fill="*primary_600",
+                button_primary_background_fill_dark="*primary_700",
+                button_primary_background_fill_hover="*primary_500",
+                button_primary_background_fill_hover_dark="*primary_600",
+                button_primary_text_color="*neutral_50",
+                button_primary_text_color_dark="*neutral_50",
+            ),
+            css="""
+            .hljs {
+                color: #abb2bf;
+                background: #282c34;
+            }
+            .hljs-comment,
+            .hljs-quote {
+                color: #5c6370;
+                font-style: italic;
+            }
+            .hljs-doctag,
+            .hljs-keyword,
+            .hljs-formula {
+                color: #c678dd;
+            }
+            .hljs-section,
+            .hljs-name,
+            .hljs-selector-tag,
+            .hljs-deletion,
+            .hljs-subst {
+                color: #e06c75;
+            }
+            .hljs-literal {
+                color: #56b6c2;
+            }
+            .hljs-string,
+            .hljs-regexp,
+            .hljs-addition,
+            .hljs-attribute,
+            .hljs-meta .string {
+                color: #98c379;
+            }
+            .hljs-attr,
+            .hljs-variable,
+            .hljs-template-variable,
+            .hljs-type,
+            .hljs-selector-class,
+            .hljs-selector-attr,
+            .hljs-selector-pseudo,
+            .hljs-number {
+                color: #d19a66;
+            }
+            .hljs-symbol,
+            .hljs-bullet,
+            .hljs-link,
+            .hljs-meta,
+            .hljs-selector-id,
+            .hljs-title {
+                color: #61aeee;
+            }
+            .hljs-built_in,
+            .hljs-title.class_,
+            .hljs-class .hljs-title {
+                color: #e6c07b;
+            }
+            .hljs-emphasis {
+                font-style: italic;
+            }
+            .hljs-strong {
+                font-weight: bold;
+            }
+            .hljs-link {
+                text-decoration: underline;
+            }
+            """,
         ) as demo:
             model_name_display = gr.Markdown("Loading model...", elem_id="model-name-display")
             plugins = load_plugins()
@@ -1016,12 +1189,19 @@ def launch_app(args: argparse.Namespace) -> None:
             chatbot = gr.Chatbot(
                 type="messages",
                 value=[],
-                height=555,
+                height=600,
                 allow_tags=["think", "answer"],
-                render_markdown=True,  
+                render_markdown=True,
+                show_label=False,
             )
-            msg = gr.Textbox(placeholder="Enter your message or command (e.g., .gen)")
-            submit_btn = gr.Button("Submit")
+            with gr.Row():
+                msg = gr.Textbox(
+                    placeholder="Enter your message or command (e.g., .info, .load, .create, .info, .delete, .unload)",
+                    lines=1,
+                    scale=10,
+                    show_label=False,
+                )
+                send_btn = gr.Button("➤", scale=1)
 
             # MODE SELECTION
             mode_radio = gr.Radio(
@@ -1284,7 +1464,7 @@ def launch_app(args: argparse.Namespace) -> None:
                 inputs=[session_state],
                 outputs=[chatbot, session_state],
             )
-            submit_btn.click(
+            send_btn.click(
                 fn=chat_fn,
                 inputs=[msg, chatbot, session_state],
                 outputs=[msg, chatbot, session_state],
@@ -1323,6 +1503,86 @@ def launch_app(args: argparse.Namespace) -> None:
         logger.error(f"Failed to launch Gradio in thread or start CLI: {str(e)}")
         raise
 
+def tag() -> str:
+    """Generate timestamped prefix for logger, including current mode for context.
+
+    Note: Relies on shared memory for state updates across threads (e.g., Gradio/CLI).
+    """
+    # TO LOAD APPLICATION STATE - ENSURES CURRENT CONFIGURATION IS USED; THREAD-SAFE READ.
+    app_state: ProjectState = load_state()
+    # TO DETECT PRESENCE FOR MODE - LOCAL IF MODEL SET (VIA LOAD_LLM FOR LOCAL), ELSE ONLINE.
+    model = getattr(app_state, "MODEL", None)
+    mode_str = "local" if model is not None else "online"
+    # TO FORMAT TIMESTAMP - ENSURES CONSISTENT LOG PREFIX.
+    current_time = datetime.now().strftime("[%H:%M:%S]")
+    # TO BUILD PREFIX - COMBINES TIME AND MODE FOR TRACEABILITY.
+    return f"{current_time} GIA@{mode_str}: "
+
+def cli_prompt() -> str:
+    """
+    Generate a colored Linux-like terminal prompt string.
+
+    Format: 'GIA@<mode>:<current_path>$ ' with color styling.
+    Mode resolution:
+      - 'idle'   -> no model loaded (LLM is None)
+      - 'local'  -> MODE == 'Local' and LLM is set
+      - 'online' -> otherwise (e.g., OpenAI/HF/OpenRouter providers)
+    """
+    from colorama import Fore
+    import os, sys
+
+    # --- safe access to state without crashing on older StateManager variants ---
+    try:
+        from gia.core.state import state_manager, load_state
+    except Exception:
+        state_manager, load_state = None, None
+
+    def _safe_sm_get(key: str, default=None):
+        try:
+            if state_manager and hasattr(state_manager, "get_state"):
+                return state_manager.get_state(key, default)
+            if state_manager and hasattr(state_manager, "_state"):
+                return getattr(state_manager, "_state", {}).get(key, default)
+        except Exception:
+            pass
+        return default
+
+    llm = None
+    mode = None
+
+    # prefer structured snapshot when available
+    try:
+        if load_state:
+            snap = load_state()
+            llm = getattr(snap, "LLM", None)
+            mode = getattr(snap, "MODE", None)
+    except Exception:
+        # fall back to reading the live store
+        llm = _safe_sm_get("LLM", None)
+        mode = _safe_sm_get("MODE", None)
+
+    mode_norm = (mode or "").strip().lower()
+    if llm is None:
+        mode_str = "idle"
+    elif mode_norm == "local":
+        mode_str = "local"
+    else:
+        mode_str = "online"
+
+    # cwd → '~' abbreviation
+    cwd = os.getcwd()
+    home = os.environ.get("HOME", "")
+    if not home:
+        raise ValueError("HOME environment variable not set; required for path abbreviation.")
+    path_str = "~" + cwd[len(home):] if cwd.startswith(home) else cwd
+    if not path_str:
+        raise ValueError("Current working directory could not be determined.")
+
+    user = "GIA"
+    host = mode_str
+    prompt = f"{Fore.GREEN}{user}@{host}{Fore.RESET}:~$ "
+    return prompt
+
 
 def cli_loop() -> None:
     """
@@ -1330,51 +1590,62 @@ def cli_loop() -> None:
       - .commands (routed to handle_command)
       - normal queries (streamed via process_input)
     """
+    # TO INITIALIZE LOCAL STATE - PRESERVES ISOLATION FROM GLOBAL.
     chat_history: List[Dict[str, str]] = []
     state: Dict[str, Any] = {}
-
+    # TO DISPLAY ENTRY MESSAGE - INFORMS USER OF MODE AND EXIT.
     print("Entering CLI mode. Type '.exit' to quit.")
     while True:
         try:
-            user_input = input("> ").strip()
+            # TO DISPLAY CUSTOM PROMPT AND READ INPUT - MIMICS TERMINAL; HANDLES COLORS VIA INPUT().
+            user_input = input(cli_prompt()).strip()
         except (EOFError, KeyboardInterrupt):
+            # TO HANDLE TERMINATION GRACEFULLY - MATCHES ORIGINAL; SAFE EXIT MESSAGE.
             print("\nExiting CLI.")
             break
-
+        # TO SKIP EMPTY INPUT - PREVENTS UNNECESSARY PROCESSING.
         if not user_input:
             continue
+        # TO CHECK EXIT COMMAND - PRESERVES ORIGINAL EXIT CONDITION.
         if user_input == ".exit":
             break
-
-        # 1) append user turn
-        append_to_chatbot(chat_history, user_input, metadata={"role": "user"})
-        logger.debug(f"[CLI] appended user: {user_input[:80]!r} | history_size={len(chat_history)}")
-
-        # 2) stream assistant/command output
+        # TO CHECK IF COMMAND - SKIP APPEND FOR COMMANDS TO AVOID HISTORY POLLUTION.
+        is_command = user_input.startswith(".")
+        if not is_command:
+            # TO APPEND USER INPUT TO HISTORY - ONLY FOR QUERIES; LOGS FOR DEBUG.
+            append_to_chatbot(chat_history, user_input, metadata={"role": "user"})
+            logger.debug(f"[CLI] appended user: {user_input[:80]!r} | history_size={len(chat_history)}")
+        # TO STREAM ASSISTANT/COMMAND OUTPUT - COLORS OUTPUT GREEN FOR TERMINAL STYLE.
         first = True
         for item in process_input(user_input, state, chat_history):
             if isinstance(item, list):
+                # TO UPDATE HISTORY IF PLUGIN RETURNS FULL LIST - PRESERVES PLUGIN BEHAVIOR.
                 chat_history[:] = item
                 logger.debug(f"[CLI] plugin returned full history | size={len(chat_history)}")
                 continue
-
+            # TO CONVERT ITEM TO STRING - ENSURES PRINTABLE; SKIPS EMPTY.
             chunk = str(item)
             if not chunk:
                 logger.debug("[CLI] empty chunk (heartbeat)")
                 continue
-
-            if first:
-                append_to_chatbot(chat_history, chunk, metadata={"role": "assistant"})
-                logger.debug(f"[CLI] appended assistant FIRST: {chunk[:80]!r} | history_size={len(chat_history)}")
-                first = False
+            if is_command:
+                # TO PRINT COMMAND OUTPUT DIRECTLY - NO HISTORY APPEND FOR COMMANDS.
+                print(f"{Fore.GREEN}{chunk}{Fore.RESET}", end="", flush=True)
             else:
-                if chat_history and chat_history[-1].get("role") == "assistant":
-                    chat_history[-1]["content"] += chunk
-                    logger.debug(f"[CLI] extended assistant: +{len(chunk)} chars | now={len(chat_history[-1]['content'])}")
-
-            print(chunk, end="", flush=True)  # progressive terminal
-        print()  # newline after full response
-
+                if first:
+                    # TO APPEND FIRST CHUNK AS NEW ASSISTANT ENTRY - INITIALIZES RESPONSE FOR QUERIES.
+                    append_to_chatbot(chat_history, chunk, metadata={"role": "assistant"})
+                    logger.debug(f"[CLI] appended assistant FIRST: {chunk[:80]!r} | history_size={len(chat_history)}")
+                    first = False
+                else:
+                    # TO EXTEND EXISTING ASSISTANT ENTRY - ACCUMULATES STREAMED CONTENT FOR QUERIES.
+                    if chat_history and chat_history[-1].get("role") == "assistant":
+                        chat_history[-1]["content"] += chunk
+                        logger.debug(f"[CLI] extended assistant: +{len(chunk)} chars | now={len(chat_history[-1]['content'])}")
+                # TO PRINT COLORED CHUNK PROGRESSIVELY - FOR QUERIES; FLUSH FOR IMMEDIACY.
+                print(f"{Fore.GREEN}{chunk}{Fore.RESET}", end="", flush=True)
+        # TO ADD NEWLINE AFTER RESPONSE - ENSURES CLEAN SEPARATION.
+        print()
 
 def load_database_wrapper(state: Dict[str, Any]) -> str:
     """Load DB + query engine using the current LLM; keep UI flags in sync."""

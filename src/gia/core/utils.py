@@ -7,7 +7,7 @@ import time
 import gc
 import hashlib
 import requests
-import importlib
+import tomllib
 from typing import Tuple, Optional, Dict, Any, Type, List
 from datetime import datetime
 from colorama import Fore, Style
@@ -30,6 +30,14 @@ from llama_index.core.schema import TextNode
 from llama_index.core.vector_stores.types import (
     MetadataFilter, MetadataFilters, FilterOperator, FilterCondition
 )
+
+# In utils.py
+from typing import Optional
+from llama_index.core.llms import LLM, ChatMessage, MessageRole
+from llama_index.llms.openai import OpenAI as LlamaOpenAI
+from llama_index.llms.huggingface import HuggingFaceLLM
+from llama_index.llms.huggingface_api import HuggingFaceInferenceAPI
+
 from transformers import LogitsProcessor, LogitsProcessorList
 from gptqmodel import GPTQModel
 from llama_index.llms.huggingface import HuggingFaceLLM
@@ -43,11 +51,11 @@ from gia.core.logger import logger, log_banner
 from gia.config import CONFIG, get_config
 from gia.core.state import state_manager
 from gia.core.state import load_state
+from gia.config import PROJECT_ROOT
 import chromadb
 
 log_banner(__file__)
 
-RULES_PATH = CONFIG["RULES_PATH"]
 CONTEXT_WINDOW = CONFIG["CONTEXT_WINDOW"]
 MAX_NEW_TOKENS = CONFIG["MAX_NEW_TOKENS"]
 TEMPERATURE = CONFIG["TEMPERATURE"]
@@ -62,15 +70,7 @@ DB_PATH = CONFIG["DB_PATH"]
 DEBUG = CONFIG["DEBUG"]
 DEVICE_MAP: str = ("cuda" if __import__("torch").cuda.is_available() else "cpu")
 
-from llama_index.llms.huggingface import HuggingFaceLLM
-from llama_index.llms.openai import OpenAI as LlamaOpenAI
-from llama_index.llms.huggingface_api import HuggingFaceInferenceAPI
-
 ###
-
-
-from typing import List, Dict, Optional, Any
-import hashlib
 
 def _hash_text(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", "ignore")).hexdigest()
@@ -116,17 +116,53 @@ def append_to_chatbot(
 
 ####
 
+def get_qa_prompt() -> str:
+    """
+    Load QA prompt dynamically from config.toml (safe at import time).
+    Appends "/no_think" if MODEL_TYPE == "qwen3".
+    Returns a single string joined by newlines.
+    """
+    config_path = PROJECT_ROOT.parent.parent / "config.toml"
+    qa_prompt_list: list[str] = []
 
-def get_qa_prompt():
-    with open(get_config("RULES_PATH"), "r") as f:
-        rules = json.load(f)
-    qa_prompt_tmpl = "\n".join(rules["qa_prompt"])
-    return qa_prompt_tmpl
+    # Read prompt from config.toml (safe fallbacks)
+    try:
+        if config_path.exists():
+            with config_path.open("rb") as f:
+                _cfg = tomllib.load(f)
+            prompt_data = _cfg.get("prompt", {}).get("qa_prompt", None)
+            if isinstance(prompt_data, str):
+                qa_prompt_list = [prompt_data]
+            elif isinstance(prompt_data, list) and all(isinstance(item, str) for item in prompt_data):
+                qa_prompt_list = prompt_data
+            else:
+                logger.info("Invalid 'prompt.qa_prompt' in config.toml (must be str or list[str]); using empty prompt.")
+        else:
+            logger.info(f"config.toml not found at {config_path}; using empty prompt.")
+    except (tomllib.TOMLDecodeError, OSError) as e:
+        logger.info(f"Error reading/parsing config.toml: {e}; using empty prompt.")
+    except Exception as e:
+        logger.info(f"Unexpected error in get_qa_prompt: {e}; using empty prompt.")
 
+    # Import-time safe MODEL_TYPE resolution
+    model_type = None
+    try:
+        # Only call state_manager.get_state if it's actually available & callable
+        get_state = getattr(state_manager, "get_state", None)
+        if callable(get_state):
+            model_type = get_state("MODEL_TYPE", CONFIG.get("MODEL_TYPE"))
+        else:
+            model_type = CONFIG.get("MODEL_TYPE")
+    except Exception as e:
+        logger.debug(f"(STATE) get_state unavailable during import: {e}; defaulting to CONFIG['MODEL_TYPE'].")
+        model_type = CONFIG.get("MODEL_TYPE")
 
+    if isinstance(model_type, str) and model_type.lower() == "qwen3":
+        qa_prompt_list.append("/no_think")
+
+    return "\n".join(qa_prompt_list)
 QA_PROMPT_TMPL = get_qa_prompt()
 QA_PROMPT = PromptTemplate(QA_PROMPT_TMPL)
-
 
 ####
 
@@ -178,19 +214,6 @@ class PresencePenaltyLogitsProcessor(LogitsProcessor):
 
 global_logits_processor = LogitsProcessorList([PresencePenaltyLogitsProcessor()])
 
-from llama_index.core.llms import LLM, ChatMessage, MessageRole
-from llama_index.llms.openai import OpenAI as LlamaOpenAI
-from llama_index.llms.huggingface import HuggingFaceLLM
-
-# In utils.py
-from typing import Optional
-from llama_index.core.llms import LLM, ChatMessage, MessageRole
-from llama_index.llms.openai import OpenAI as LlamaOpenAI
-from llama_index.llms.huggingface import HuggingFaceLLM
-
-
-
-
 ####
 
 def _init_embed_model(device: str) -> HuggingFaceEmbedding:
@@ -214,11 +237,52 @@ def _init_embed_model(device: str) -> HuggingFaceEmbedding:
         embed_model._model = embed_model._model.half()  # FP16 FOR VRAM EFFICIENCY
     return embed_model
 
-####
+#DB CREATION WITH OPTIMIZED EMBEDDINGS
+def _resolve_collection_name() -> str:
+    """
+    Resolve the Chroma collection name from config.toml with safe fallbacks.
+    Order of precedence:
+      1) [database].collection_name in config.toml
+      2) CONFIG["COLLECTION_NAME"] if set
+      3) hard default "GIA_db"
+    Validates length (3..63). Never returns None.
+    """
+    # 1) Read config.toml directly for runtime truth
+    cfg_path = PROJECT_ROOT.parent.parent / "config.toml"
+    name_from_toml = None
+    try:
+        if cfg_path.exists():
+            with cfg_path.open("rb") as f:
+                _cfg = tomllib.load(f)
+            name_from_toml = (
+                _cfg.get("database", {}).get("collection_name", None)
+                if isinstance(_cfg, dict) else None
+            )
+    except Exception as e:
+        logger.warning(f"(CFG) Failed reading config.toml for collection_name: {e}")
+
+    # 2) Fallbacks: CONFIG then hard default
+    name = (
+        name_from_toml
+        or CONFIG.get("COLLECTION_NAME")
+        or "GIA_db"
+    )
+
+    # 3) Validate & sanitize
+    if not isinstance(name, str):
+        logger.warning("(CFG) COLLECTION_NAME not a string; using 'GIA_db'")
+        name = "GIA_db"
+    n = len(name)
+    if n < 3 or n > 63:
+        logger.warning("(CFG) COLLECTION_NAME length %d invalid; using 'GIA_db'", n)
+        name = "GIA_db"
+
+    return name
+
 
 def save_database():
     """Build and persist ChromaDB database with optimized embeddings."""
-    state = load_state()  # LOAD STATE AT START FOR DOT ACCESS
+    state = load_state()  # DOT-ACCESS SNAPSHOT
     if state.DATABASE_LOADED:
         logger.info("(UDB) Database already loaded, skipping save")
         return
@@ -229,16 +293,24 @@ def save_database():
         logger.info(f"Using device: {device}")
         torch.cuda.empty_cache()
 
-        # Initialize ChromaDB client
+        # Ensure DB path exists
+        Path(DB_PATH).mkdir(parents=True, exist_ok=True)
+
+        # Authoritative collection name (config.toml -> CONFIG -> 'GIA_db')
+        collection_name = _resolve_collection_name()
+        logger.info(f"(UDB) Using Chroma collection: {collection_name}")
+
+        # Initialize ChromaDB client & collection
         db = chromadb.PersistentClient(path=DB_PATH)
         chroma_collection = db.get_or_create_collection(
-            "database2", metadata={"hnsw:space": "cosine"}
+            collection_name, metadata={"hnsw:space": "cosine"}
         )
         vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
 
-        # Configure embedding model
+        # Embedding model
         embed_model = _init_embed_model(device)
 
+        # Empty index (we insert nodes incrementally)
         storage_context = StorageContext.from_defaults(vector_store=vector_store)
         index = VectorStoreIndex.from_documents(
             documents=[],
@@ -247,12 +319,16 @@ def save_database():
             show_progress=False,
         )
 
-        # Load and process files
-        file_paths = [
-            os.path.join(DATA_PATH, f)
-            for f in os.listdir(DATA_PATH)
-            if f.endswith(".txt")
-        ]
+        # Load *.txt files (graceful if none)
+        if not os.path.isdir(DATA_PATH):
+            logger.warning(f"DATA_PATH does not exist: {DATA_PATH} — proceeding with empty index.")
+            file_paths: list[str] = []
+        else:
+            file_paths = [
+                os.path.join(DATA_PATH, f)
+                for f in os.listdir(DATA_PATH)
+                if f.endswith(".txt")
+            ]
         total_files = len(file_paths)
         logger.info(f"Found {total_files} text files to process")
 
@@ -261,18 +337,12 @@ def save_database():
         chunk_overlap = 50
         splitter = SentenceSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
-        for batch_start in tqdm(
-            range(0, total_files, file_batch_size), desc="Processing file batches"
-        ):
+        for batch_start in tqdm(range(0, total_files, file_batch_size), desc="Processing file batches"):
             batch_end = min(batch_start + file_batch_size, total_files)
             batch_paths = file_paths[batch_start:batch_end]
             try:
-                logger.info(
-                    f"Loading batch {batch_start // file_batch_size + 1} ({batch_start}-{batch_end})"
-                )
-                documents = SimpleDirectoryReader(
-                    input_files=batch_paths, encoding="utf-8"
-                ).load_data()
+                logger.info(f"Loading batch {batch_start // file_batch_size + 1} ({batch_start}-{batch_end})")
+                documents = SimpleDirectoryReader(input_files=batch_paths, encoding="utf-8").load_data()
                 logger.info(f"Loaded {len(documents)} documents in batch")
 
                 batch_nodes = []
@@ -280,9 +350,7 @@ def save_database():
                     chunks = splitter.split_text(doc.text)
                     for chunk in chunks:
                         node_metadata = {
-                            "filename": os.path.basename(
-                                doc.metadata.get("file_path", "")
-                            ),
+                            "filename": os.path.basename(doc.metadata.get("file_path", "")),
                             "date": time.strftime("%Y-%m-%d"),
                         }
                         batch_nodes.append(TextNode(text=chunk, metadata=node_metadata))
@@ -290,21 +358,15 @@ def save_database():
                 logger.info(f"Created {len(batch_nodes)} nodes in batch")
                 sub_batch_size = 100
                 for sub_start in range(0, len(batch_nodes), sub_batch_size):
-                    sub_batch = batch_nodes[
-                        sub_start : sub_start + sub_batch_size
-                    ]  # FIXED SLICE NOTATION
+                    sub_batch = batch_nodes[sub_start : sub_start + sub_batch_size]
                     index.insert_nodes(sub_batch)
                     torch.cuda.empty_cache()
 
                 logger.info(f"Completed batch: {len(batch_nodes)} nodes inserted")
-                logger.info(
-                    f"Current node count in ChromaDB: {chroma_collection.count()}"
-                )
+                logger.info(f"Current node count in ChromaDB: {chroma_collection.count()}")
                 del documents, batch_nodes
             except Exception as e:
-                logger.error(
-                    f"Error in batch {batch_start // file_batch_size + 1}: {e}"
-                )
+                logger.error(f"Error in batch {batch_start // file_batch_size + 1}: {e}")
                 torch.cuda.empty_cache()
                 continue
 
@@ -312,7 +374,8 @@ def save_database():
         logger.info(
             f"ChromaDB database with ~{total_files} files (~{chroma_collection.count()} nodes) created in: {elapsed_time / 3600:.2f} hours"
         )
-        # Set state after initialization
+
+        # Persist handles in state
         state_manager.set_state("CHROMA_COLLECTION", chroma_collection)
         state_manager.set_state("EMBED_MODEL", embed_model)
         state_manager.set_state("INDEX", index)
@@ -321,11 +384,12 @@ def save_database():
         logger.critical(f"Database creation failed: {e}")
         raise
 
+
 ####
 
 def load_database(llm: Optional[object] = None) -> str:
     """One-time ChromaDB initializer."""
-    state = load_state()  # LOAD STATE AT START FOR DOT ACCESS
+    state = load_state()
     if state.DATABASE_LOADED:
         logger.info("(UDB) Database already loaded, skipping initialization")
         logger.debug(f"(UDB) Index state: {state.INDEX}")
@@ -336,20 +400,26 @@ def load_database(llm: Optional[object] = None) -> str:
         clear_vram()
         start_time = time.time()
 
-        # Initialize ChromaDB client
+        # Ensure DB path exists
+        Path(DB_PATH).mkdir(parents=True, exist_ok=True)
+
+        # Authoritative collection name
+        collection_name = _resolve_collection_name()
+        logger.info(f"(UDB) Using Chroma collection: {collection_name}")
+
+        # Initialize ChromaDB client & collection
         db = chromadb.PersistentClient(path=DB_PATH)
         chroma_collection = db.get_or_create_collection(
-            "database2", metadata={"hnsw:space": "cosine"}
+            collection_name, metadata={"hnsw:space": "cosine"}
         )
 
-        # Configure bge-large-en-v1.5
+        # Embeddings
         device = "cuda" if torch.cuda.is_available() else "cpu"
         embed_model = _init_embed_model(device)
 
+        # Vector store & index
         vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
         storage_context = StorageContext.from_defaults(vector_store=vector_store)
-
-        # Set index
         index = VectorStoreIndex.from_vector_store(
             vector_store,
             embed_model=embed_model,
@@ -359,11 +429,9 @@ def load_database(llm: Optional[object] = None) -> str:
         logger.debug(f"(UDB) Index set: {index}")
 
         if llm is None:
-            raise ValueError(
-                "Error: no model loaded. Confirm a model before loading the database."
-            )
+            raise ValueError("Error: no model loaded. Confirm a model before loading the database.")
 
-        # Create default query engine with accumulate mode
+        # Query engine
         query_engine = index.as_query_engine(
             llm=llm,
             similarity_top_k=2,
@@ -376,11 +444,10 @@ def load_database(llm: Optional[object] = None) -> str:
         )
         logger.debug(f"(UDB) Query engine set: {query_engine}")
 
-        logger.info(
-            f"ChromaDB loaded with {chroma_collection.count()} entries in {time.time() - start_time:.2f}s"
-        )
+        logger.info(f"ChromaDB loaded with {chroma_collection.count()} entries in {time.time() - start_time:.2f}s")
         clear_vram()
-        # Set state after initialization
+
+        # Persist handles in state
         state_manager.set_state("CHROMA_COLLECTION", chroma_collection)
         state_manager.set_state("EMBED_MODEL", embed_model)
         state_manager.set_state("INDEX", index)
@@ -391,6 +458,7 @@ def load_database(llm: Optional[object] = None) -> str:
         logger.critical(f"Database loading failed: {e}")
         state_manager.set_state("INDEX", None)
         raise
+
 
 ####
 
@@ -407,9 +475,10 @@ def update_database(
         raise FileNotFoundError(f"One or more files not found: {filepaths}")
 
     if state.CHROMA_COLLECTION is None:
-        db = chromadb.PersistentClient(path="./db")
+        Path(DB_PATH).mkdir(parents=True, exist_ok=True)
+        db = chromadb.PersistentClient(path=DB_PATH)
         chroma_collection = db.get_or_create_collection(
-            "database2",
+            _resolve_collection_name(),
             metadata={"hnsw:space": "cosine"},
         )
     else:
@@ -673,14 +742,13 @@ def fetch_openai_models() -> list:
 
 def load_llm(mode: str, config: Dict) -> Tuple[str, Optional[LLM]]:
     """Load LLM based on mode and config.
-
     Args:
         mode: LLM mode.
         config: Configuration dict.
-
     Returns:
         Message and loaded LLM or None.
     """
+    # TO SAFELY EXTRACT MODEL NAME - FALLBACK TO CONFIG OR GLOBAL; SECURITY: NO EXECUTION, STRING ONLY.
     try:
         logger.debug(f"Loading LLM for mode: {mode} with config: {config}")
         model_name = config.get("model_name") or config.get("model_path") or MODEL_PATH
@@ -689,28 +757,33 @@ def load_llm(mode: str, config: Dict) -> Tuple[str, Optional[LLM]]:
         logger.debug(f"Load success for {mode}: {model_name}")
         return f"{mode} model loaded: {model_name}", llm
     except Exception as e:
+        # TO HANDLE LOAD ERRORS GRACEFULLY - LOG WITHOUT EXPOSING SENSITIVE DETAILS; RISK: PARTIAL STATE IF FAILS, BUT CALLER HANDLES NONE.
         error_msg = f"Load failed for {mode}: {str(e)}"
         logger.error(error_msg)
         return error_msg, None
-
-def create_llm(mode: str, model_name: str) -> Any:
+    
+from transformers import AutoTokenizer
+def create_llm(mode: str, model_name: str) -> Optional[LLM]:
     """Create LLM instance based on mode and model name."""
+    # TO VALIDATE MODE - PREVENTS INVALID OPERATIONS EARLY; SECURITY: RESTRICTS TO KNOWN MODES, NO ARBITRARY EXEC.
     if mode not in {"Local", "HuggingFace", "OpenAI", "OpenRouter"}:
         raise ValueError("Invalid mode. Use: Local | HuggingFace | OpenAI | OpenRouter.")
+    # TO VALIDATE MODEL NAME - ENSURES NON-EMPTY STRING; EDGE CASE: EMPTY LEADS TO API FAILURES DOWNSTREAM.
     if not isinstance(model_name, str) or not model_name.strip():
         raise ValueError("Model name must be a non-empty string.")
-
+    # TO PRE-CLEAR VRAM - ENSURES RESOURCE AVAILABILITY; PERFORMANCE: PREVENTS OOM IN LOAD; RISK: IF FAILS, SUBSEQUENT CALLS MAY STILL OOM BUT HANDLED IN EXCEPT.
     clear_vram()
     logger.debug(f"Creating LLM for mode: {mode}, model: {model_name}")
-
     if mode == "Local":
-        pretrained = GPTQModel.load(
-            model_id_or_path=model_name,
+        # TO SET EXPLICIT MODE - ENABLES ACCURATE DETECTION ACROSS THREADS; ASSUMPTION: LOCAL IMPLIES OFFLINE/QUANTIZED MODEL.
+        state_manager.set_state("MODE", "Local")
+        # TO LOAD QUANTIZED MODEL - USES CORRECT API PER LIBRARY DOCS; SECURITY: TRUST_REMOTE_CODE=TRUE FOR HF COMPAT, BUT LIMIT TO TRUSTED MODELS; EDGE CASE: INVALID PATH RAISES, CAUGHT BELOW.
+        pretrained = GPTQModel.from_quantized(
+            model_name,
             device_map=DEVICE_MAP,
             use_safetensors=True,
             trust_remote_code=True,
         )
-
         llm = HuggingFaceLLM(
             model=pretrained.model,
             tokenizer=pretrained.tokenizer,
@@ -727,13 +800,14 @@ def create_llm(mode: str, model_name: str) -> Any:
                 "logits_processor": global_logits_processor,
             },
             device_map=DEVICE_MAP,
-            is_chat_model=False, 
+            is_chat_model=False,
         )
         state_manager.set_state("USE_CHAT", True)
         logger.info("HF Local LLM ready (no cap in generate_kwargs; QE/direct compatible).")
         return llm
-
     if mode == "HuggingFace":
+        # TO SET EXPLICIT MODE - INDICATES ONLINE/API USAGE; PERFORMANCE: NO LOCAL RESOURCES NEEDED.
+        state_manager.set_state("MODE", "Online")
         llm = HuggingFaceInferenceAPI(
             model_name=model_name,
             api_key=__import__("os").getenv("HF_TOKEN"),
@@ -743,11 +817,19 @@ def create_llm(mode: str, model_name: str) -> Any:
             temperature=float(TEMPERATURE),       # SAFE SAMPLING PARAMS
             top_p=float(TOP_P),
         )
+        token = __import__("os").getenv("HF_TOKEN")
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_name, token=token)
+            llm.__pydantic_private__["_tokenizer"] = tokenizer
+            logger.debug(f"Tokenizer loaded and attached to __pydantic_private__ for {model_name}.")
+        except Exception as e:
+            logger.warning(f"Failed to load tokenizer for {model_name}: {str(e)}. Token counting may be approximate.")
         state_manager.set_state("USE_CHAT", False)
         logger.info("HF Inference API LLM ready (single cap via constructor; chat disabled).")
         return llm
-
     if mode == "OpenAI":
+        # TO SET EXPLICIT MODE - INDICATES ONLINE/API USAGE; SECURITY: API KEY FROM ENV, NO HARDCODE.
+        state_manager.set_state("MODE", "Online")
         llm = LlamaOpenAI(
             model=model_name,
             api_key=__import__("os").getenv("OPENAI_API_KEY"),
@@ -758,9 +840,10 @@ def create_llm(mode: str, model_name: str) -> Any:
         state_manager.set_state("USE_CHAT", True)
         logger.info("OpenAI LLM ready (cap via max_tokens in constructor).")
         return llm
-
     # OPENROUTER — STREAMS FINE; USE max_tokens IN CTOR
     if mode == "OpenRouter":
+        # TO SET EXPLICIT MODE - INDICATES ONLINE/API USAGE; EDGE CASE: MISSING KEY RAISES IN CONSTRUCTOR.
+        state_manager.set_state("MODE", "Online")
         llm = OpenRouter(
             model=model_name,
             api_key=__import__("os").getenv("OPENROUTER_API_KEY"),
@@ -771,161 +854,172 @@ def create_llm(mode: str, model_name: str) -> Any:
         state_manager.set_state("USE_CHAT", True)
         logger.info("OpenRouter LLM ready (cap via max_tokens in constructor).")
         return llm
-
     # UNREACHABLE DUE TO VALIDATION
     raise ValueError(f"Unhandled mode: {mode}")
-
 
 def generate(
     query: str,
     system_prompt: str,
     llm: Any,
-    *,
     max_new_tokens: Optional[int] = None,
     think: bool = False,
     depth: int = 0,
     **kwargs: Any,
 ) -> str:
-    """PRIMARY GENERATION PIPELINE WITH OOM-RESILIENCE + TOKEN METRICS"""
+    """
+    PRIMARY GENERATION PIPELINE (NON-STREAM). BULLETPROOF FOR TRANSFORMERS >= 4.55.
 
-    # FAILSAFE: DEPTH LIMIT TO PREVENT INFINITE OOM RECURSION
-    if depth > 3:
-        return "ERROR: MAX OOM RETRY DEPTH EXCEEDED — CLEAR VRAM MANUALLY."
+    Args:
+        query: User prompt (free-form).
+        system_prompt: System instruction prefix.
+        llm: LlamaIndex HuggingFaceLLM or OpenAI-like LLM wrapper.
+        max_new_tokens: Optional hard cap for generation length.
+        think: Reserved flag (kept for interface compatibility).
+        depth: Retry depth (for OOM exponential backoff).
+        **kwargs: Extra model.generate() kwargs (safe subset only).
 
-    # MODEL NAME EXTRACTION
-    model_name = kwargs.get("model") or getattr(llm, "model_name", "")
-    engine = kwargs.get("engine")
+    Returns:
+        Model text output (str). Returns a descriptive error message on failure.
+    """
 
-    # CONDITIONAL CONTROL TAG: ONLY FOR CYBERSIC / QWEN3 FAMILY
-    control_tag = ""
-    if model_name and any(x in model_name for x in ("CyberSic", "Qwen3")):
-        control_tag = "/think" if think else "/no_think"
+    start_time = time.time()
 
-    # PROMPT ASSEMBLY
-    full_prompt = f"{system_prompt}\n{control_tag}\n{query}" if control_tag else f"{system_prompt}\n{query}"
+    # === INPUT SANITY & PROMPT ASSEMBLY ======================================
+    user_text = (query or "").strip()
+    sys_text = (system_prompt or "").strip()
+    if not user_text and not sys_text:
+        return "EMPTY PROMPT."
 
-    # DYNAMIC MODEL RELOAD (FAILS SAFE TO WARNING)
-    if model_name and engine:
-        try:
-            llm = create_llm(engine, model_name)
-        except Exception as e:
-            logger.warning(f"MODEL LOAD FAILURE [{engine}/{model_name}] — {e}")
-            return f"ERROR LOADING MODEL: {str(e)}"
+    prompt = f"{sys_text}\n{user_text}" if sys_text else user_text
 
-    # TOKEN LIMIT SELECTION (CONTRACT: IF PROVIDED, USE IT; ELSE FALLBACK)
-    target_tokens = (
-        max_new_tokens
-        if isinstance(max_new_tokens, int) and max_new_tokens > 0
-        else MAX_NEW_TOKENS
+    # === TARGET TOKENS & STATE SNAPSHOT ======================================
+    previous_max: Optional[int] = getattr(llm, "max_new_tokens", None)
+    target_tokens: int = (
+        int(max_new_tokens)
+        if max_new_tokens is not None
+        else int(previous_max or 256)
     )
 
-    # STATE CAPTURE: SAVE ORIGINAL LIMIT FOR RESTORE
-    previous_max = getattr(llm, "max_new_tokens", None) if hasattr(llm, "max_new_tokens") else None
-
-    # ENFORCE TOKEN LIMIT ACROSS MULTIPLE ATTRIBUTES (HF / OPENAI / CUSTOM WRAPPERS)
     try:
-        if hasattr(llm, "max_new_tokens"):
-            llm.max_new_tokens = target_tokens
-        if hasattr(llm, "max_tokens"):
-            setattr(llm, "max_tokens", target_tokens)
-        for attr in ("_max_new_tokens", "_max_tokens"):
-            if hasattr(llm, attr):
-                setattr(llm, attr, target_tokens)
-        if hasattr(llm, "generate_kwargs") and isinstance(llm.generate_kwargs, dict):
-            llm.generate_kwargs["max_new_tokens"] = target_tokens
-            llm.generate_kwargs.pop("max_length", None)  # REMOVE LEGACY KEY TO AVOID EARLY CUTOFF
-    except Exception as e:
-        logger.debug(f"TOKEN ATTR SYNC FAILED — NON-FATAL: {e}")
-
-    # HELPER: NORMALIZE RESPONSE TO STRING (HANDLES MULTIPLE WRAPPERS)
-    def _to_text(obj: Any) -> str:
+        # === HUGGINGFACE (LLAMA-INDEX WRAPPER) PATH ==========================
         try:
-            if hasattr(obj, "message") and getattr(obj, "message") is not None:
-                msg = getattr(obj, "message")
-                if hasattr(msg, "content") and isinstance(msg.content, str) and msg.content.strip():
-                    return msg.content
-            if hasattr(obj, "text") and isinstance(obj.text, str) and obj.text.strip():
-                return obj.text
-            if hasattr(obj, "raw") and isinstance(obj.raw, list) and obj.raw:
-                first = obj.raw[0]
-                if isinstance(first, dict) and "generated_text" in first:
-                    return str(first["generated_text"])
-                return " ".join(str(x) for x in obj.raw if isinstance(x, (str, int, float)))
-            if isinstance(obj, dict):
-                if "generated_text" in obj:
-                    return str(obj["generated_text"])
-                if "text" in obj:
-                    return str(obj["text"])
-            return str(obj)
+            from llama_index.llms.huggingface import HuggingFaceLLM as _HFL_TYPE  # type: ignore[attr-defined]
         except Exception:
-            return str(obj)
+            _HFL_TYPE = tuple()  # type: ignore[assignment]
 
-    # EXECUTION START
-    start_time = time.time()
-    try:
-        with torch.no_grad():
-            kwargs_gen: dict[str, Any] = {"max_tokens": target_tokens}
+        if isinstance(llm, _HFL_TYPE) and hasattr(llm, "_model") and hasattr(llm, "_tokenizer"):
+            model = llm._model
+            tok = llm._tokenizer
+            device = getattr(model, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
-            # PRIMARY MODE: CHAT IF ENABLED
-            use_chat = state_manager.get_state("USE_CHAT", True)
-            if use_chat:
-                chat_msgs = [
-                    ChatMessage(role=MessageRole.SYSTEM, content=system_prompt),
-                ]
-                if control_tag:
-                    chat_msgs.append(ChatMessage(role=MessageRole.SYSTEM, content=control_tag))
-                chat_msgs.append(ChatMessage(role=MessageRole.USER, content=query))
+            # --- TOKENIZE WITH SPECIALS; AVOID ZERO-LENGTH PROMPTS -----------
+            enc = tok(prompt, return_tensors="pt", add_special_tokens=True)
+            input_ids = enc.get("input_ids", None)
 
-                try:
-                    response = llm.chat(chat_msgs, **kwargs_gen)
-                    streamed_text = _to_text(response)
-                except requests.exceptions.HTTPError as e:
-                    if e.response.status_code == 404:
-                        logger.warning("CHAT ENDPOINT 404 — PERMANENTLY FALLING BACK TO COMPLETE().")
-                        state_manager.set_state("USE_CHAT", False)
-                        response = llm.complete(full_prompt, **kwargs_gen)
-                        streamed_text = _to_text(response)
-                    else:
-                        raise
-                if not streamed_text.strip():
-                    logger.warning("EMPTY CHAT RESPONSE — FALLBACK TO COMPLETE().")
-                    response = llm.complete(full_prompt, **kwargs_gen)
-                    streamed_text = _to_text(response)
+            # # MILITARY GUARD: ENSURE SEQ_LEN >= 1 (BOS -> EOS -> 0)
+            if input_ids is None or input_ids.numel() == 0 or input_ids.shape[-1] == 0:
+                if getattr(tok, "bos_token_id", None) is not None:
+                    fid = tok.bos_token_id
+                elif getattr(tok, "eos_token_id", None) is not None:
+                    fid = tok.eos_token_id
+                else:
+                    fid = 0  # LAST RESORT: NON-NEGATIVE TOKEN INDEX
+                    logger.warning("No BOS/EOS; using token_id=0 as fallback to avoid empty input_ids.")
+                input_ids = torch.tensor([[fid]], dtype=torch.long)
+                attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+                enc = {"input_ids": input_ids, "attention_mask": attention_mask}
+
+            # DEVICE MOVE (DICT-SAFE) -----------------------------------------
+            input_ids = enc["input_ids"].to(device)
+            attention_mask = enc.get("attention_mask", None)
+            if attention_mask is None:
+                # ENSURE A VALID MASK IF TOKENIZER DID NOT PROVIDE ONE
+                attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=device)
             else:
-                response = llm.complete(full_prompt, **kwargs_gen)
-                streamed_text = _to_text(response)
+                attention_mask = attention_mask.to(device)
 
+            # PAD-ID FALLBACK (SUPPRESSES HF PAD WARNINGS) --------------------
+            pad_id: Optional[int] = getattr(tok, "pad_token_id", None)
+            if pad_id is None and getattr(tok, "eos_token_id", None) is not None:
+                pad_id = tok.eos_token_id  # pass as kwarg (do not mutate tok globally)
+
+            # --- GENERATION KWARGS (MINIMAL, EXPLICIT) ------------------------
+            gen_kwargs: Dict[str, Any] = {
+                "input_ids": input_ids,
+                "max_new_tokens": target_tokens,
+                "do_sample": True,
+                "top_p": float(getattr(llm, "top_p", kwargs.get("top_p", 0.95))),
+                "temperature": float(getattr(llm, "temperature", kwargs.get("temperature", 0.7))),
+                "use_cache": False,  # <-- KEY FIX: BYPASS cache_position PATH
+                "pad_token_id": pad_id,
+                "attention_mask": attention_mask,
+                "return_dict_in_generate": True,
+            }
+            # MERGE SAFE EXTRAS WITHOUT OVERRIDING CRITICAL GUARDS ------------
+            for k in ("repetition_penalty", "top_k", "min_new_tokens", "no_repeat_ngram_size"):
+                if k in kwargs and kwargs[k] is not None:
+                    gen_kwargs[k] = kwargs[k]
+
+            # FINAL ASSERT: NO ZERO-LENGTH input_ids --------------------------
+            if gen_kwargs["input_ids"].shape[-1] == 0:
+                raise RuntimeError("Guard failed: input_ids has zero length before generate().")
+
+            # --- RUN GENERATION (SYNC) ----------------------------------------
+            with torch.inference_mode():
+                out = model.generate(**gen_kwargs)
+
+            # --- DECODE: SLICE OFF PROMPT, SKIP SPECIALS ---------------------
+            prompt_len = input_ids.shape[-1]
+            # out may be dict-like (return_dict_in_generate=True)
+            sequences = out.sequences if hasattr(out, "sequences") else out
+            new_tokens = sequences[:, prompt_len:] if sequences.shape[-1] > prompt_len else sequences
+            text = tok.decode(new_tokens[0], skip_special_tokens=True)
+
+            # === ACCOUNTING / METRICS (BEST-EFFORT) ==========================
+            streamed_text = text or ""
             if not streamed_text.strip():
                 logger.warning("EMPTY RESPONSE — CHECK PROMPT OR TOKEN LIMITS.")
                 return "EMPTY RESPONSE FROM MODEL."
 
-        # TOKEN USAGE ACCOUNTING (PREFERS TIKTOKEN, FALLBACK WORD SPLIT)
-        try:
-            import tiktoken
-            encoding = tiktoken.get_encoding("cl100k_base")
-            total_tokens = len(encoding.encode(streamed_text))
-        except Exception as e:
-            logger.warning(f"TIKTOKEN FAILED: {e} — FALLBACK TO WORD COUNT.")
-            total_tokens = len(streamed_text.split())
+            # TOKEN USAGE ACCOUNTING (PREFERS TIKTOKEN, FALLBACK WORD SPLIT)
+            try:
+                import tiktoken  # type: ignore
+                encoding = tiktoken.get_encoding("cl100k_base")
+                total_tokens = len(encoding.encode(streamed_text))
+            except Exception as e:
+                logger.warning(f"TIKTOKEN FAILED: {e} — FALLBACK TO WORD COUNT.")
+                total_tokens = len(streamed_text.split())
 
-        # PERF METRICS LOGGING
-        duration = time.time() - start_time
-        tokens_per_sec = total_tokens / duration if duration > 0 else 0
-        run_count = (state_manager.get_state("run_count") or 0) + 1
-        total_tokens_all = (state_manager.get_state("total_tokens_all") or 0) + total_tokens
-        total_duration_all = (state_manager.get_state("total_duration_all") or 0.0) + duration
-        state_manager.set_state("run_count", run_count)
-        state_manager.set_state("total_tokens_all", total_tokens_all)
-        state_manager.set_state("total_duration_all", total_duration_all)
-        avg_tps = total_tokens_all / total_duration_all if total_duration_all > 0 else 0
-        logger.info(
-            f"INFER TIME={duration:.2f}s | TOKENS={total_tokens} | "
-            f"AVG_TPS={avg_tps:.2f} | CURR_TPS={tokens_per_sec:.2f}"
-        )
+            # PERF METRICS LOGGING
+            duration = time.time() - start_time
+            tokens_per_sec = total_tokens / duration if duration > 0 else 0
+            try:
+                run_count = (state_manager.get_state("run_count") or 0) + 1  # type: ignore[name-defined]
+                total_tokens_all = (state_manager.get_state("total_tokens_all") or 0) + total_tokens  # type: ignore[name-defined]
+                total_duration_all = (state_manager.get_state("total_duration_all") or 0.0) + duration  # type: ignore[name-defined]
+                state_manager.set_state("run_count", run_count)  # type: ignore[name-defined]
+                state_manager.set_state("total_tokens_all", total_tokens_all)  # type: ignore[name-defined]
+                state_manager.set_state("total_duration_all", total_duration_all)  # type: ignore[name-defined]
+                avg_tps = total_tokens_all / total_duration_all if total_duration_all > 0 else 0
+                logger.info(
+                    f"INFER TIME={duration:.2f}s | TOKENS={total_tokens} | "
+                    f"AVG_TPS={avg_tps:.2f} | CURR_TPS={tokens_per_sec:.2f}"
+                )
+            except Exception:
+                # STATE MANAGER OPTIONAL — DO NOT HARD FAIL ON METRICS
+                pass
 
-        return streamed_text.strip()
+            return streamed_text.strip()
 
-    # OOM HANDLING: REDUCE TOKENS AND RECUR
+        # === OPENAI-LIKE PATH (FALLBACK) =====================================
+        complete = getattr(llm, "complete", None)
+        if callable(complete):
+            resp = llm.complete(f"{system_prompt}\n{query}")
+            return (resp.text if hasattr(resp, "text") else str(resp)).strip()
+
+        return "LLM BACKEND UNSUPPORTED FOR GENERATION."
+
+    # === OOM HANDLING: REDUCE TOKENS AND RECUR ===============================
     except torch.cuda.OutOfMemoryError as e:
         logger.warning(f"OOM DURING GENERATION — {e}. RETRYING WITH HALF TOKENS.")
         clear_vram()
@@ -942,17 +1036,18 @@ def generate(
             **kwargs,
         )
 
-    # GENERIC FAILURE
+    # === GENERIC FAILURE =====================================================
     except Exception as e:
         error_msg = f"GENERATION FAILURE — {e}"
         logger.error(error_msg)
         return error_msg
 
-    # ALWAYS CLEAR VRAM + RESTORE ORIGINAL STATE IF NEEDED
+    # === ALWAYS CLEAR VRAM + RESTORE ORIGINAL STATE ==========================
     finally:
         clear_vram()
         if max_new_tokens is not None and previous_max is not None and hasattr(llm, "max_new_tokens"):
             llm.max_new_tokens = previous_max
+
 
 
 __all__ = [

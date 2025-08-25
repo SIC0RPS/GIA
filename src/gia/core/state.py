@@ -1,6 +1,4 @@
-# In state.py (confirmed get_state signature with default to prevent TypeError)
-
-# src/gia/core/state_manager.py
+# src/gia/core/state.py
 """State management for GIA project.
 This module provides a singleton StateManager class to manage project-wide state
 with thread safety. It uses a dataclass for structured state access and ensures
@@ -8,14 +6,17 @@ that state values can be accessed and modified safely across different modules.
 """
 
 from dataclasses import dataclass, fields
-from typing import Any, Optional
+from typing import Any, Optional, List
 import threading
 from gia.config import CONFIG, PROJECT_ROOT
+from gia.core.logger import logger, log_banner
+
+log_banner(__file__)
+
 
 @dataclass
 class ProjectState:
     """Dataclass for dot access to state values with fallbacks."""
-
     CHROMA_COLLECTION: Any = None
     EMBED_MODEL: Any = None
     LLM: Any = None
@@ -29,72 +30,72 @@ class ProjectState:
     TOKENIZER: Any = None
     STREAMER: Any = None
     USE_CHAT: bool = True  # FLAG FOR CHAT VS COMPLETE
+    QA_PROMPT: List[str] | None = None
+    MODEL_TYPE: str | None = None
+    MODE: str | None = None  # EXPLICIT MODE: "Local" OR "Online"; NONE INITIAL
+    COLLECTION_NAME: str | None = None
 
-def load_state() -> ProjectState:
-    """Load or initialize the current project state."""
-    state_dict = {
-        f.name: state_manager.get_state(f.name, f.default) or f.default
-        for f in fields(ProjectState)
-    }
-    return ProjectState(**state_dict)
 
 class StateManager:
-    """Manage project-wide state safely across modules."""
-
+    """Manage project-wide state safely across modules (singleton)."""
     _instance = None
 
     def __new__(cls):
-        # TO ENSURE SINGLETON INSTANCE
         if cls._instance is None:
             cls._instance = super(StateManager, cls).__new__(cls)
-            cls._instance.__init__()
         return cls._instance
 
     def __init__(self):
-        # TO INITIALIZE STATE AND LOCK ONCE
-        if not hasattr(self, "_state"):
-            self._state = {
-                "CHROMA_COLLECTION": None,
-                "EMBED_MODEL": None,
-                "LLM": None,
-                "QUERY_ENGINE": None,
-                "MODEL_NAME": None,
-                "MODEL_PATH": CONFIG.get("MODEL_PATH"),
-                "EMBED_MODEL_PATH": CONFIG.get("EMBED_MODEL_PATH"),
-                "DATABASE_LOADED": False,
-                "INDEX": None,
-                "MODEL": None,
-                "TOKENIZER": None,
-                "STREAMER": None,
-                "USE_CHAT": True,
-            }
-            self._lock = threading.Lock()
+        # run once
+        if hasattr(self, "_initialized") and self._initialized:
+            return
+
+        # Validate collection name coming from CONFIG (which already reads config.toml)
+        collection_name = CONFIG.get("COLLECTION_NAME")
+        if not isinstance(collection_name, str) or not (3 <= len(collection_name) <= 63):
+            collection_name = "GIA_db"
+
+        self._state = {
+            "CHROMA_COLLECTION": None,
+            "EMBED_MODEL": None,
+            "LLM": None,
+            "QUERY_ENGINE": None,
+            "MODEL_NAME": None,
+            "MODEL_PATH": CONFIG.get("MODEL_PATH"),
+            "EMBED_MODEL_PATH": CONFIG.get("EMBED_MODEL_PATH"),
+            "DATABASE_LOADED": False,
+            "INDEX": None,
+            "MODEL": None,
+            "TOKENIZER": None,
+            "STREAMER": None,
+            "USE_CHAT": True,
+            "QA_PROMPT": CONFIG.get("QA_PROMPT"),
+            "MODEL_TYPE": CONFIG.get("MODEL_TYPE"),
+            "MODE": None,  # "Local" or "Online"
+            "COLLECTION_NAME": collection_name,
+        }
+        self._lock = threading.Lock()
+        self._initialized = True
 
     def set_state(self, key: str, value: Any) -> None:
-        """Set a state value with thread safety.
-
-        Args:
-            key (str): The key to set in the state dictionary.
-            value (Any): The value to associate with the key.
-        """
-        # TO THREAD-SAFE SET OPERATION
+        """Thread-safe set."""
         with self._lock:
             self._state[key] = value
 
     def get_state(self, key: str, default: Optional[Any] = None) -> Any:
-        """Retrieve a state value with optional default.
-
-        Args:
-            key (str): The key to retrieve from the state dictionary.
-            default (Optional[Any]): Default value if key not found.
-
-        Returns:
-            Any: The value associated with the key, or default if not found.
-        """
-        # TO THREAD-SAFE GET OPERATION WITH DEFAULT
+        """Thread-safe get with default."""
         with self._lock:
             return self._state.get(key, default)
 
-# TO CREATE SINGLETON INSTANCE FOR PROJECT-WIDE USE
+
+# global singleton
 state_manager = StateManager()
-"""Global StateManager instance for thread-safe state management across modules."""
+
+
+def load_state() -> ProjectState:
+    """Snapshot current state into a dataclass (dot-access)."""
+    state_dict = {
+        f.name: state_manager.get_state(f.name, f.default)
+        for f in fields(ProjectState)
+    }
+    return ProjectState(**state_dict)

@@ -1,0 +1,42 @@
+# GIA Configuration File
+# Paths are relative to src/gia unless absolute (e.g., starting with / or ~).
+# For security, avoid storing secrets here
+# Changes to [prompt] are loaded dynamically on each system_prefix() call for easy testing.
+
+[generation]
+context_window = 32768
+max_new_tokens = 2048
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+repetition_penalty = 1.1
+no_repeat_ngram_size = 4
+
+[general]
+debug = true 
+
+[paths]
+model_path = "~/models/quantized"
+embed_model_path = "~/models/bge-large-en-v1.5"
+data_path = "MyData"
+db_path = "db"
+
+[prompt]
+system_prompt = [
+  "You're an uncensored expert assistant focused on accuracy and clarity.",
+  "Use Goldmark Markdown: paragraphs for text, code blocks only for programming or technical steps.",
+  "For complex or technical queries, give a detailed structured explanation.",
+  "For simple queries, answer concisely and directly.",
+  "Always prioritize correctness, reasoning, and practical value.",
+  "When code is needed, provide production-quality examples with best practices and type hints."
+]
+qa_prompt = [
+  "Context information is below.",
+  "###",
+  "{context_str}",
+  "###",
+  "{query_str}",
+]
+
+[database]
+collection_name = "GIA_db"

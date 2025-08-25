@@ -1,72 +1,188 @@
 # src/gia/config.py
-# IMPORT STANDARD LIBRARIES AND TYPING
 import os
-import json  # For loading rules.json
+import tomllib  # Built-in for reading TOML (Python 3.11+)
+import json
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, Union
 
-# PROJECT ROOT FOR RELATIVE PATH RESOLUTION
+# PROJECT ROOT FOR RELATIVE PATH RESOLUTION (points to src/gia)
 PROJECT_ROOT = Path(__file__).resolve().parent
 
-# DEFAULT CONFIGURATION VALUES (USER-EDITABLE)
-CONTEXT_WINDOW = 32768
-MAX_NEW_TOKENS = 4096
-TEMPERATURE = 0.7
-TOP_P = 0.8
-TOP_K = 20
-REPETITION_PENALTY = 1.1
-NO_REPEAT_NGRAM_SIZE = 4
-DEBUG = True
-DEFAULT_SYSTEM_PROMPT = "You are an expert assistant. Provide accurate, reliable, and evidence-based answers."
+# DEFAULTS (used if config.toml missing/absent keys)
+DEFAULTS: Dict[str, Any] = {
+    "CONTEXT_WINDOW": 32768,
+    "MAX_NEW_TOKENS": 4096,
+    "TEMPERATURE": 0.7,
+    "TOP_P": 0.8,
+    "TOP_K": 20,
+    "REPETITION_PENALTY": 1.1,
+    "NO_REPEAT_NGRAM_SIZE": 4,
+    "DEBUG": True,
+    "MODEL_PATH": "~/models/quantized",
+    "EMBED_MODEL_PATH": "~/models/bge-large-en-v1.5",
+    "DATA_PATH": "MyData",  # relative to PROJECT_ROOT (src/gia)
+    "DB_PATH": "db",
+    "QA_PROMPT": [
+        "Context information is below.",
+        "###",
+        "{context_str}",
+        "###",
+        "{query_str}",
+    ],
+    # >>> Authoritative default collection name <<<
+    "COLLECTION_NAME": "GIA_db",
+}
 
-MODEL_PATH = "~/models/quantized"
-EMBED_MODEL_PATH = "~/models/bge-large-en-v1.5"
-DATA_PATH = "MyData"        # RELATIVE TO PROJECT_ROOT/src/gia
-DB_PATH = "db"              
-RULES_PATH = "db/rules.json"  
+# Fallback system prompt (if config.toml lacks prompt.system_prompt)
+DEFAULT_SYSTEM_PROMPT = (
+    "You are an expert assistant. Provide accurate, reliable, and evidence-based answers."
+)
 
-# LOAD ENVIRONMENT VARIABLES FROM .env IF AVAILABLE (NON-FATAL ON FAILURE)
+# Optionally load .env (non-fatal if missing)
 try:
     import dotenv  # type: ignore
     from dotenv import load_dotenv
-    load_dotenv(override=False) # Do not override existing environment variables
+    load_dotenv(override=False)
 except ImportError:
-    print("Warning: python-dotenv not installed; skipping .env loading.")
+    from gia.core.logger import logger  # deferred import
+    logger.info("Warning: python-dotenv not installed; skipping .env loading.")
 except FileNotFoundError as e:
-    print(f"Warning: .env file not found: {e}")
+    from gia.core.logger import logger
+    logger.info(f"Warning: .env file not found: {e}")
 except ValueError as e:
-    print(f"Warning: Failed to parse .env file: {e}")
+    from gia.core.logger import logger
+    logger.info(f"Warning: Failed to parse .env file: {e}")
 
-# BUILD CONFIGURATION DICTIONARY (NO API KEYS STORED; FETCH ON-DEMAND VIA OS.GETENV)
-CONFIG: Dict[str, Optional[Any]] = {
-    "CONTEXT_WINDOW": CONTEXT_WINDOW,
-    "MAX_NEW_TOKENS": MAX_NEW_TOKENS,
-    "TEMPERATURE": TEMPERATURE,
-    "TOP_P": TOP_P,
-    "TOP_K": TOP_K,
-    "REPETITION_PENALTY": REPETITION_PENALTY,
-    "NO_REPEAT_NGRAM_SIZE": NO_REPEAT_NGRAM_SIZE,
-    "DEBUG": DEBUG,
-    "MODEL_PATH": os.path.expanduser(MODEL_PATH),
-    "EMBED_MODEL_PATH": os.path.expanduser(EMBED_MODEL_PATH),
-    "RULES_PATH": str(PROJECT_ROOT / RULES_PATH),
-    "DATA_PATH": str(PROJECT_ROOT / DATA_PATH),
-    "DB_PATH": str(PROJECT_ROOT / DB_PATH),
-}
+# Load config.toml (top-level repo root: PROJECT_ROOT/../../config.toml)
+config_path = PROJECT_ROOT.parent.parent / "config.toml"
+config_dict: Dict[str, Any] = {}
+if config_path.exists():
+    try:
+        with config_path.open("rb") as f:
+            config_dict = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        from gia.core.logger import logger
+        logger.info(f"Warning: Failed to parse config.toml: {e}. Falling back to defaults.")
+    except OSError as e:
+        from gia.core.logger import logger
+        logger.info(f"Warning: Failed to read config.toml: {e}. Falling back to defaults.")
+else:
+    from gia.core.logger import logger
+    logger.info("Warning: config.toml not found. Falling back to defaults.")
 
-# VALIDATE FILE/DIRECTORY PATHS AND ENSURE THEY EXIST
-for key, path in CONFIG.items():
-    if isinstance(path, str) and ("PATH" in key):
+# Build CONFIG (absolute paths first)
+CONFIG: Dict[str, Optional[Any]] = {}
+CONFIG["MODEL_PATH"] = str(Path(os.path.expanduser(
+    config_dict.get("paths", {}).get("model_path", DEFAULTS["MODEL_PATH"])
+)).resolve())
+CONFIG["EMBED_MODEL_PATH"] = str(Path(os.path.expanduser(
+    config_dict.get("paths", {}).get("embed_model_path", DEFAULTS["EMBED_MODEL_PATH"])
+)).resolve())
+CONFIG["DATA_PATH"] = str((PROJECT_ROOT / config_dict.get("paths", {}).get("data_path", DEFAULTS["DATA_PATH"])).resolve())
+CONFIG["DB_PATH"] = str((PROJECT_ROOT / config_dict.get("paths", {}).get("db_path", DEFAULTS["DB_PATH"])).resolve())
+
+# ----- MODEL DEFAULTS / GENERATION SETTINGS -----
+from transformers import PretrainedConfig
+def get_default_generation_settings(model_path: str) -> Dict[str, Optional[Union[int, float, str]]]:
+    """Extract selected defaults from model config.json & generation_config.json."""
+    if not isinstance(model_path, str) or not model_path.strip():
+        raise ValueError("model_path must be a non-empty string.")
+    settings: Dict[str, Optional[Union[int, float, str]]] = {
+        'context_window': None,
+        'max_new_tokens': None,
+        'temperature': None,
+        'top_p': None,
+        'top_k': None,
+        'repetition_penalty': None,
+        'no_repeat_ngram_size': None,
+        'model_type': None,
+    }
+    try:
+        cfg, _ = PretrainedConfig.get_config_dict(model_path)
+    except EnvironmentError as e:
+        raise ValueError(f"Failed to load config from '{model_path}': {str(e)}") from e
+    if cfg:
+        for key in ('max_position_embeddings', 'n_positions', 'model_max_length'):
+            if key in cfg and isinstance(cfg[key], int):
+                settings['context_window'] = cfg[key]
+                break
+        if isinstance(cfg.get('model_type'), str):
+            settings['model_type'] = cfg['model_type']
+    try:
+        gen_cfg, _ = PretrainedConfig.get_config_dict(model_path, _filename='generation_config.json')
+    except EnvironmentError:
+        gen_cfg = {}
+    if gen_cfg:
+        if isinstance(gen_cfg.get('max_new_tokens'), int):
+            settings['max_new_tokens'] = gen_cfg['max_new_tokens']
+        if isinstance(gen_cfg.get('temperature'), (int, float)):
+            settings['temperature'] = float(gen_cfg['temperature'])
+        if isinstance(gen_cfg.get('top_p'), (int, float)):
+            settings['top_p'] = float(gen_cfg['top_p'])
+        if isinstance(gen_cfg.get('top_k'), int):
+            settings['top_k'] = gen_cfg['top_k']
+        if isinstance(gen_cfg.get('repetition_penalty'), (int, float)):
+            settings['repetition_penalty'] = float(gen_cfg['repetition_penalty'])
+        if isinstance(gen_cfg.get('no_repeat_ngram_size'), int):
+            settings['no_repeat_ngram_size'] = gen_cfg['no_repeat_ngram_size']
+    return settings
+
+try:
+    model_defaults = get_default_generation_settings(CONFIG["MODEL_PATH"])
+except ValueError:
+    model_defaults = {}
+    from gia.core.logger import logger
+    logger.info(f"Warning: Failed to load model defaults from '{CONFIG['MODEL_PATH']}'. Falling back to hardcoded defaults.")
+
+generation_keys = [
+    'context_window',
+    'max_new_tokens',
+    'temperature',
+    'top_p',
+    'top_k',
+    'repetition_penalty',
+    'no_repeat_ngram_size',
+]
+for k in generation_keys:
+    upper_k = k.upper()
+    val = config_dict.get("generation", {}).get(k, model_defaults.get(k, DEFAULTS.get(upper_k)))
+    CONFIG[upper_k] = val
+CONFIG["MODEL_TYPE"] = model_defaults.get('model_type', None)
+
+# ----- GENERAL / PROMPTS -----
+CONFIG["DEBUG"] = config_dict.get("general", {}).get("debug", DEFAULTS["DEBUG"])
+
+qa_prompt_data = config_dict.get("prompt", {}).get("qa_prompt", DEFAULTS["QA_PROMPT"])
+if isinstance(qa_prompt_data, str):
+    CONFIG["QA_PROMPT"] = [qa_prompt_data]
+elif isinstance(qa_prompt_data, list) and all(isinstance(item, str) for item in qa_prompt_data):
+    CONFIG["QA_PROMPT"] = qa_prompt_data
+else:
+    from gia.core.logger import logger
+    logger.info("Warning: Invalid 'prompt.qa_prompt' in config.toml (must be str or list[str]). Falling back to default.")
+    CONFIG["QA_PROMPT"] = DEFAULTS["QA_PROMPT"]
+
+# ----- COLLECTION NAME (authoritative from config.toml with safe fallback to GIA_db) -----
+def _validate_collection_name(name: Any, default: str = "GIA_db") -> str:
+    """Ensure a non-empty 3..63 char string for Chroma collection names."""
+    if not isinstance(name, str):
+        return default
+    n = len(name)
+    if n < 3 or n > 63:
+        return default
+    return name
+
+_raw_name = config_dict.get("database", {}).get("collection_name", DEFAULTS["COLLECTION_NAME"])
+CONFIG["COLLECTION_NAME"] = _validate_collection_name(_raw_name, DEFAULTS["COLLECTION_NAME"])
+
+# ----- PATH VALIDATION / CREATION -----
+for key, value in CONFIG.items():
+    if isinstance(value, str) and "PATH" in key:
         try:
-            path_obj = Path(path)
-            if "RULES_PATH" in key:
-                if not path_obj.exists():
-                    # WARN IF RULES FILE IS MISSING (WILL FALL BACK TO DEFAULT PROMPT)
-                    print(f"Warning: Required file not found: {path}. Falling back to default system prompt.")
-            else:
-                path_obj.mkdir(parents=True, exist_ok=True)
+            path_obj = Path(value)
+            path_obj.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            raise RuntimeError(f"Failed to create/validate {key}: {path} - {e}") from e
+            raise RuntimeError(f"Failed to create/validate {key}: {value} - {e}") from e
 
 def get_config(key: str, default: Optional[Any] = None) -> Optional[Any]:
     """Retrieve a configuration value or return the default if not set."""
@@ -74,39 +190,27 @@ def get_config(key: str, default: Optional[Any] = None) -> Optional[Any]:
 
 def system_prefix() -> str:
     """
-    Load system prompt from CONFIG or rules.json file, handling all edge cases.
+    Load system prompt dynamically from config.toml.
     Priority:
-        1. CONFIG["SYSTEM_PROMPT"] if defined.
-        2. RULES_PATH file if exists and valid.
-        3. DEFAULT_SYSTEM_PROMPT as fallback.
+      1. prompt.system_prompt (string or list of strings)
+      2. DEFAULT_SYSTEM_PROMPT
     """
+    from gia.core.logger import logger
+    config_path = PROJECT_ROOT.parent.parent / "config.toml"
     try:
-        system_prompt = CONFIG.get("SYSTEM_PROMPT", None)
-        rules_path_obj = Path(CONFIG["RULES_PATH"]) if CONFIG.get("RULES_PATH") else None
-
-        # Use config prompt directly if defined
-        if system_prompt:
-            return str(system_prompt)
-
-        # Attempt rules.json if available
-        if rules_path_obj and rules_path_obj.exists():
-            try:
-                with rules_path_obj.open("r", encoding="utf-8") as f:
-                    rules = json.load(f)
-
-                prompt_data = rules.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
-                if isinstance(prompt_data, str):
-                    return prompt_data
+        if config_path.exists():
+            with config_path.open("rb") as f:
+                _cfg = tomllib.load(f)
+            prompt_data = _cfg.get("prompt", {}).get("system_prompt", None)
+            if isinstance(prompt_data, str):
+                return prompt_data
+            if isinstance(prompt_data, list) and all(isinstance(item, str) for item in prompt_data):
                 return "\n".join(prompt_data)
-            except (json.JSONDecodeError, IOError) as e:
-                print(f"Error reading/parsing RULES_PATH '{rules_path_obj}': {e}")
-                return DEFAULT_SYSTEM_PROMPT
-
-        # Warn if rules file missing
-        if rules_path_obj and not rules_path_obj.exists():
-            print(f"Warning: RULES_PATH not found at {rules_path_obj}. Falling back to DEFAULT_SYSTEM_PROMPT.")
-
+            logger.info("Warning: Invalid 'prompt.system_prompt' in config.toml (must be str or list[str]). Falling back.")
+        else:
+            logger.info(f"Warning: config.toml not found at {config_path}. Falling back to default system prompt.")
+    except (tomllib.TOMLDecodeError, OSError) as e:
+        logger.info(f"Error reading/parsing config.toml: {e}. Falling back to default system prompt.")
     except Exception as e:
-        print(f"Unexpected error in system_prefix: {e}")
-
+        logger.info(f"Unexpected error in system_prefix: {e}")
     return DEFAULT_SYSTEM_PROMPT
