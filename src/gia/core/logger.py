@@ -92,7 +92,9 @@ class SignatureFilter(logging.Filter):
         return True
 
 class ColoredFormatter(logging.Formatter):
-    """Format log messages with dynamic length and color based on level."""
+    """Format log messages with dynamic length and color based on level.
+    Falls back to plain formatting when NO_COLOR is set or stdout is not a TTY.
+    """
     LEVEL_COLORS = {
         logging.DEBUG: Fore.BLUE,
         logging.INFO: Fore.GREEN,
@@ -102,28 +104,39 @@ class ColoredFormatter(logging.Formatter):
     }
 
     def format(self, record):
+        # AUTO-DISABLE COLOR IN NON-TTY OR WHEN NO_COLOR IS SET
+        use_color = (
+            hasattr(sys, "stdout")
+            and sys.stdout is not None
+            and getattr(sys.stdout, "isatty", lambda: False)()
+            and not os.environ.get("NO_COLOR")
+            and not CONFIG.get("NO_COLOR", False)
+        )
+
         func_display = record.funcName if record.funcName != "" else record.name
-        # TO APPEND SIGNATURE IF AVAILABLE
         if hasattr(record, 'signature') and record.signature:
             func_display += record.signature
-        func_color = self.LEVEL_COLORS.get(record.levelno, Fore.WHITE)
         asctime = self.formatTime(record, "%H:%M:%S")
         msg = _anonymize_path(record.getMessage().replace("\n", "\\n"))
-        # TO INCLUDE FULL TRACEBACK FOR WARNING/ERROR/CRITICAL IN DEBUG MODE
         if CONFIG["DEBUG"] and record.exc_info and record.levelno >= logging.WARNING:
             exc_text = self.formatException(record.exc_info)
             exc_text = _anonymize_path(exc_text)
             msg += f"\n{exc_text}"
-        # TO SET DYNAMIC MAX_LENGTH BASED ON LOG LEVEL (NO TRUNCATION FOR WARNING IN DEBUG)
         max_length = {
             logging.DEBUG: 5000 if CONFIG["DEBUG"] else 500,
             logging.INFO: 500,
             logging.WARNING: float('inf') if CONFIG["DEBUG"] else 500,
-            logging.ERROR: float('inf'),  # NO TRUNCATION
-            logging.CRITICAL: float('inf'),  # NO TRUNCATION
+            logging.ERROR: float('inf'),
+            logging.CRITICAL: float('inf'),
         }.get(record.levelno, 500)
         if max_length != float('inf') and len(msg) > max_length:
             msg = msg[: max_length - 3] + "..."
+
+        if not use_color:
+            # PLAIN FALLBACK IN CRITICAL/NON-TTY PATHS
+            return f"[{asctime}|{record.levelname}|{func_display}|{msg}]"
+
+        func_color = self.LEVEL_COLORS.get(record.levelno, Fore.WHITE)
         formatted = (
             f"{Fore.WHITE}[{Fore.WHITE}{asctime}{Fore.WHITE}|{Fore.CYAN}{record.levelname}{Fore.WHITE}|"
             f"{func_color}{func_display}{Fore.WHITE}|{Fore.LIGHTBLACK_EX}{msg}{Fore.WHITE}]{Style.RESET_ALL}"
@@ -284,31 +297,65 @@ if os.path.exists(log_file):
         logger.error(f"Failed to remove old log file: {e}")
 
 # VIEWER CODE FOR SECONDARY TERMINAL
+
 viewer_code = textwrap.dedent('''
     import sys
     import time
     import os
     import atexit
-    from colorama import Fore, Style, init
+    try:
+        from colorama import Fore, Style, init
+    except Exception:
+        # If colorama missing, run plain
+        Fore = Style = None
+        def init(*a, **k): pass
+
     init(autoreset=False)
-    LEVEL_COLORS = {
-        'DEBUG': Fore.BLUE,
-        'INFO': Fore.GREEN,
-        'WARNING': Fore.YELLOW,
-        'ERROR': Fore.RED,
-        'CRITICAL': Fore.RED,
-    }
+
+    # COLOR CONTROL: disable if NO_COLOR or non-TTY
+    use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR", "")
+
+    def _plain(asctime, level, func, msg):
+        return f"[{asctime}|{level}|{func}|{msg}]"
+
+    def _colored(asctime, level, func, msg):
+        # If color disabled or colorama unavailable, return plain
+        if not use_color or Fore is None or Style is None:
+            return _plain(asctime, level, func, msg)
+        LEVEL_COLORS = {
+            'DEBUG': Fore.BLUE,
+            'INFO': Fore.GREEN,
+            'WARNING': Fore.YELLOW,
+            'ERROR': Fore.RED,
+            'CRITICAL': Fore.RED,
+        }
+        level_color = LEVEL_COLORS.get(level, Fore.CYAN)
+        func_color = LEVEL_COLORS.get(level, Fore.WHITE)
+        return (
+            f"{Fore.WHITE}[{Fore.WHITE}{asctime}{Fore.WHITE}|{level_color}{level}{Fore.WHITE}|"
+            f"{func_color}{func}{Fore.WHITE}|{Fore.LIGHTBLACK_EX}{msg}{Fore.WHITE}]{Style.RESET_ALL}"
+        )
+
     # TO DELETE SELF ON EXIT TO AVOID RACE CONDITION
     atexit.register(lambda: os.unlink(sys.argv[0]) if os.path.exists(sys.argv[0]) else None)
+
     if len(sys.argv) < 2:
-        print("Error: No log file provided.")
+        try:
+            print("Error: No log file provided.")
+        except OSError:
+            pass
         sys.exit(1)
+
     log_file = sys.argv[1]
+
     try:
         if not os.path.exists(log_file):
-            print("Log file not found. Waiting...")
+            try:
+                print("Log file not found. Waiting...")
+            except OSError:
+                pass
             time.sleep(1)
-        with open(log_file, 'r') as f:
+        with open(log_file, 'r', encoding='utf-8') as f:
             f.seek(0, 2)
             while True:
                 line = f.readline()
@@ -316,24 +363,33 @@ viewer_code = textwrap.dedent('''
                     time.sleep(0.1)
                     continue
                 line = line.rstrip()
+                out = line
                 if line.startswith('[') and line.endswith(']'):
                     parts = line[1:-1].split('|', 3)
                     if len(parts) == 4:
                         asctime, level, func, msg = parts
-                        level_color = LEVEL_COLORS.get(level, Fore.CYAN)  # COLOR LEVEL BY ITS COLOR
-                        func_color = LEVEL_COLORS.get(level, Fore.WHITE)  # COLOR FUNC BY LEVEL FOR CONSISTENCY
                         msg = msg.replace('\\\\n', '\\n')
-                        formatted = (
-                            f"{Fore.WHITE}[{Fore.WHITE}{asctime}{Fore.WHITE}|{level_color}{level}{Fore.WHITE}|"
-                            f"{func_color}{func}{Fore.WHITE}|{Fore.LIGHTBLACK_EX}{msg}{Fore.WHITE}]{Style.RESET_ALL}"
-                        )
-                        print(formatted)
-                        continue
-                print(line)
+                        out = _colored(asctime, level, func, msg)
+                try:
+                    print(out)
+                except OSError:
+                    # CRITICAL PATH: permanently disable color and retry plain once
+                    use_color = False
+                    try:
+                        print(out if out == line else _plain(asctime, level, func, msg))
+                    except OSError:
+                        # stdout is gone; exit quietly
+                        break
     except KeyboardInterrupt:
-        print("\\nLog viewer stopped.")
+        try:
+            print("\\nLog viewer stopped.")
+        except OSError:
+            pass
     except Exception as e:
-        print(f"Error in log viewer: {str(e)}")
+        try:
+            print(f"Error in log viewer: {str(e)}")
+        except OSError:
+            pass
 ''')
 
 _launched = False

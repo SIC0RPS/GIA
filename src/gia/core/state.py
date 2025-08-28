@@ -13,7 +13,6 @@ from gia.core.logger import logger, log_banner
 
 log_banner(__file__)
 
-
 @dataclass
 class ProjectState:
     """Dataclass for dot access to state values with fallbacks."""
@@ -34,7 +33,6 @@ class ProjectState:
     MODEL_TYPE: str | None = None
     MODE: str | None = None  # EXPLICIT MODE: "Local" OR "Online"; NONE INITIAL
     COLLECTION_NAME: str | None = None
-
 
 class StateManager:
     """Manage project-wide state safely across modules (singleton)."""
@@ -87,10 +85,7 @@ class StateManager:
         with self._lock:
             return self._state.get(key, default)
 
-
-# global singleton
 state_manager = StateManager()
-
 
 def load_state() -> ProjectState:
     """Snapshot current state into a dataclass (dot-access)."""

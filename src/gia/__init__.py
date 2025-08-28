@@ -9,7 +9,6 @@ from .core.utils import (
     load_database,
     get_system_info,
     append_to_chatbot,
-    PresencePenaltyLogitsProcessor,  # ADD: USED BY CALL SITES
 )
 from .core.state import state_manager
 from .core.state import load_state
@@ -23,7 +22,6 @@ __all__ = [
     "load_database",
     "get_system_info",
     "append_to_chatbot",
-    "PresencePenaltyLogitsProcessor",
     "state_manager",
     "load_state",
     "logger",
