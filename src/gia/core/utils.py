@@ -37,8 +37,6 @@ from llama_index.core.llms import LLM, ChatMessage, MessageRole
 from llama_index.llms.openai import OpenAI as LlamaOpenAI
 from llama_index.llms.huggingface import HuggingFaceLLM
 from llama_index.llms.huggingface_api import HuggingFaceInferenceAPI
-
-from transformers import LogitsProcessor, LogitsProcessorList
 from gptqmodel import GPTQModel
 from llama_index.llms.huggingface import HuggingFaceLLM
 from llama_index.llms.openrouter import OpenRouter
@@ -188,32 +186,6 @@ def get_system_info() -> tuple[float, float, list[float]]:
         gpu_usage = [0.0]  # FALLBACK: Assume no GPU usage
     return cpu_usage, memory_usage, gpu_usage
 
-
-####
-
-# PRESENCE PENALTY PROCESSOR - FOR CLEANER OUTPUT
-class PresencePenaltyLogitsProcessor(LogitsProcessor):
-    """Custom logits processor for presence penalty."""
-
-    def __init__(self, presence_penalty: float = 1.0):
-        # TO SET PENALTY
-        self.presence_penalty = presence_penalty
-
-    def __call__(
-        self, input_ids: torch.LongTensor, scores: torch.FloatTensor
-    ) -> torch.FloatTensor:
-        # TO APPLY PENALTY ON GPU
-        batch_size, vocab_size = scores.shape
-        presence = torch.zeros_like(scores)
-        for b in range(batch_size):
-            unique_tokens = torch.unique(input_ids[b])
-            valid_mask = unique_tokens < vocab_size
-            unique_tokens = unique_tokens[valid_mask]
-            presence[b, unique_tokens] = self.presence_penalty
-        return scores - presence
-
-global_logits_processor = LogitsProcessorList([PresencePenaltyLogitsProcessor()])
-
 ####
 
 def _init_embed_model(device: str) -> HuggingFaceEmbedding:
@@ -321,7 +293,7 @@ def save_database():
 
         # Load *.txt files (graceful if none)
         if not os.path.isdir(DATA_PATH):
-            logger.warning(f"DATA_PATH does not exist: {DATA_PATH} — proceeding with empty index.")
+            logger.warning(f"DATA_PATH does not exist: {DATA_PATH} â€” proceeding with empty index.")
             file_paths: list[str] = []
         else:
             file_paths = [
@@ -674,10 +646,10 @@ def clear_vram() -> None:
             cpu_usage, memory_usage, gpu_usage = get_system_info()  # FIXED UNPACKING
             if memory_usage > 80 or any(g > 80 for g in gpu_usage):
                 logger.warning(
-                    f"High usage: CPU {cpu_usage}%, RAM {memory_usage}%, GPU {gpu_usage}%—cleared, monitor for leaks."
+                    f"High usage: CPU {cpu_usage}%, RAM {memory_usage}%, GPU {gpu_usage}%â€”cleared, monitor for leaks."
                 )
             logger.info(
-                f"VRAM cleared—CPU: {cpu_usage}%, RAM: {memory_usage}%, GPU: {gpu_usage}%"
+                f"VRAM clearedâ€”CPU: {cpu_usage}%, RAM: {memory_usage}%, GPU: {gpu_usage}%"
             )
             return
         except RuntimeError as e:
@@ -797,7 +769,6 @@ def create_llm(mode: str, model_name: str) -> Optional[LLM]:
                 "repetition_penalty": float(REPETITION_PENALTY),
                 "no_repeat_ngram_size": int(NO_REPEAT_NGRAM_SIZE),
                 "do_sample": True,
-                "logits_processor": global_logits_processor,
             },
             device_map=DEVICE_MAP,
             is_chat_model=False,
@@ -806,15 +777,14 @@ def create_llm(mode: str, model_name: str) -> Optional[LLM]:
         logger.info("HF Local LLM ready (no cap in generate_kwargs; QE/direct compatible).")
         return llm
     if mode == "HuggingFace":
-        # TO SET EXPLICIT MODE - INDICATES ONLINE/API USAGE; PERFORMANCE: NO LOCAL RESOURCES NEEDED.
         state_manager.set_state("MODE", "Online")
         llm = HuggingFaceInferenceAPI(
             model_name=model_name,
             api_key=__import__("os").getenv("HF_TOKEN"),
             provider="auto",
             is_chat_model=False,
-            num_output=int(MAX_NEW_TOKENS),       # SINGLE SOURCE OF TRUTH FOR OUTPUT CAP
-            temperature=float(TEMPERATURE),       # SAFE SAMPLING PARAMS
+            num_output=int(MAX_NEW_TOKENS),
+            temperature=float(TEMPERATURE),
             top_p=float(TOP_P),
         )
         token = __import__("os").getenv("HF_TOKEN")
@@ -840,7 +810,7 @@ def create_llm(mode: str, model_name: str) -> Optional[LLM]:
         state_manager.set_state("USE_CHAT", True)
         logger.info("OpenAI LLM ready (cap via max_tokens in constructor).")
         return llm
-    # OPENROUTER — STREAMS FINE; USE max_tokens IN CTOR
+    # OPENROUTER â€” STREAMS FINE; USE max_tokens IN CTOR
     if mode == "OpenRouter":
         # TO SET EXPLICIT MODE - INDICATES ONLINE/API USAGE; EDGE CASE: MISSING KEY RAISES IN CONSTRUCTOR.
         state_manager.set_state("MODE", "Online")
@@ -861,47 +831,58 @@ def generate(
     query: str,
     system_prompt: str,
     llm: Any,
+    *,
     max_new_tokens: Optional[int] = None,
     think: bool = False,
     depth: int = 0,
     **kwargs: Any,
 ) -> str:
     """
-    PRIMARY GENERATION PIPELINE (NON-STREAM). BULLETPROOF FOR TRANSFORMERS >= 4.55.
+    Minimal non-stream generation for local HF (transformers>=4.55) and OpenAI-like backends.
 
-    Args:
-        query: User prompt (free-form).
-        system_prompt: System instruction prefix.
-        llm: LlamaIndex HuggingFaceLLM or OpenAI-like LLM wrapper.
-        max_new_tokens: Optional hard cap for generation length.
-        think: Reserved flag (kept for interface compatibility).
-        depth: Retry depth (for OOM exponential backoff).
-        **kwargs: Extra model.generate() kwargs (safe subset only).
-
-    Returns:
-        Model text output (str). Returns a descriptive error message on failure.
+    TOKEN BUDGET:
+      - Exactly uses `max_new_tokens` arg when provided, else CONFIG.MAX_NEW_TOKENS.
+      - No hidden 256 fallback; no `max_length` used anywhere.
+    SAFETY (HF path):
+      - Ensures non-empty Long input_ids/attention_mask.
+      - Disables cache path that triggers cache_position IndexError.
     """
+    import torch  # LOCAL IMPORT TO AVOID GLOBAL SIDE-EFFECTS
 
-    start_time = time.time()
-
-    # === INPUT SANITY & PROMPT ASSEMBLY ======================================
+    # --- PROMPT BUILD (SYSTEM → optional control_tag → USER) ---
     user_text = (query or "").strip()
     sys_text = (system_prompt or "").strip()
     if not user_text and not sys_text:
         return "EMPTY PROMPT."
 
-    prompt = f"{sys_text}\n{user_text}" if sys_text else user_text
+    model_name = getattr(llm, "model_name", "") or getattr(llm, "model", "") or ""
+    control_tag = ""
+    if model_name and any(x in str(model_name) for x in ("CyberSic", "Qwen3")):
+        control_tag = "/think" if think else "/no_think"
 
-    # === TARGET TOKENS & STATE SNAPSHOT ======================================
-    previous_max: Optional[int] = getattr(llm, "max_new_tokens", None)
-    target_tokens: int = (
-        int(max_new_tokens)
-        if max_new_tokens is not None
-        else int(previous_max or 256)
-    )
+    if control_tag:
+        prompt = f"{sys_text}\n{control_tag}\n{user_text}" if sys_text else f"{control_tag}\n{user_text}"
+    else:
+        prompt = f"{sys_text}\n{user_text}" if sys_text else user_text
+
+    # --- RESOLVE TARGET TOKENS (STRICT; NO SILENT 256 FALLBACK) ---
+    target_tokens: int = int(max_new_tokens) if max_new_tokens is not None else int(MAX_NEW_TOKENS)
+
+    # --- BEST-EFFORT: SYNC ATTRS ON WRAPPERS SO THEY DON'T OVERRIDE THE BUDGET ---
+    prev_max = getattr(llm, "max_new_tokens", None)
+    try:
+        if hasattr(llm, "max_new_tokens"):
+            llm.max_new_tokens = target_tokens
+        if hasattr(llm, "max_tokens"):
+            setattr(llm, "max_tokens", target_tokens)
+        if hasattr(llm, "generate_kwargs") and isinstance(llm.generate_kwargs, dict):
+            llm.generate_kwargs["max_new_tokens"] = target_tokens
+            llm.generate_kwargs.pop("max_length", None)
+    except Exception:
+        pass
 
     try:
-        # === HUGGINGFACE (LLAMA-INDEX WRAPPER) PATH ==========================
+        # ---------- LOCAL HF (HuggingFaceLLM) PATH ----------
         try:
             from llama_index.llms.huggingface import HuggingFaceLLM as _HFL_TYPE  # type: ignore[attr-defined]
         except Exception:
@@ -912,142 +893,80 @@ def generate(
             tok = llm._tokenizer
             device = getattr(model, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
-            # --- TOKENIZE WITH SPECIALS; AVOID ZERO-LENGTH PROMPTS -----------
+            # TOKENIZE WITH SPECIALS
             enc = tok(prompt, return_tensors="pt", add_special_tokens=True)
-            input_ids = enc.get("input_ids", None)
-
-            # # MILITARY GUARD: ENSURE SEQ_LEN >= 1 (BOS -> EOS -> 0)
+            input_ids = enc.get("input_ids")
             if input_ids is None or input_ids.numel() == 0 or input_ids.shape[-1] == 0:
-                if getattr(tok, "bos_token_id", None) is not None:
-                    fid = tok.bos_token_id
-                elif getattr(tok, "eos_token_id", None) is not None:
-                    fid = tok.eos_token_id
-                else:
-                    fid = 0  # LAST RESORT: NON-NEGATIVE TOKEN INDEX
-                    logger.warning("No BOS/EOS; using token_id=0 as fallback to avoid empty input_ids.")
+                fid = (
+                    int(getattr(tok, "bos_token_id"))
+                    if getattr(tok, "bos_token_id", None) is not None
+                    else (int(getattr(tok, "eos_token_id")) if getattr(tok, "eos_token_id", None) is not None else 0)
+                )
                 input_ids = torch.tensor([[fid]], dtype=torch.long)
                 attention_mask = torch.ones_like(input_ids, dtype=torch.long)
                 enc = {"input_ids": input_ids, "attention_mask": attention_mask}
 
-            # DEVICE MOVE (DICT-SAFE) -----------------------------------------
+            # DEVICE MOVE + DTYPE ENFORCEMENT (Long for embedding indices)
             input_ids = enc["input_ids"].to(device)
-            attention_mask = enc.get("attention_mask", None)
-            if attention_mask is None:
-                # ENSURE A VALID MASK IF TOKENIZER DID NOT PROVIDE ONE
-                attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=device)
-            else:
-                attention_mask = attention_mask.to(device)
+            attention_mask = (enc.get("attention_mask") or torch.ones_like(input_ids, dtype=torch.long)).to(device)
+            if input_ids.dtype is not torch.long:
+                input_ids = input_ids.long()
+            if attention_mask.dtype is not torch.long:
+                attention_mask = attention_mask.long()
 
-            # PAD-ID FALLBACK (SUPPRESSES HF PAD WARNINGS) --------------------
-            pad_id: Optional[int] = getattr(tok, "pad_token_id", None)
+            # PAD ID WITHOUT MUTATING TOKENIZER
+            pad_id = getattr(tok, "pad_token_id", None)
             if pad_id is None and getattr(tok, "eos_token_id", None) is not None:
-                pad_id = tok.eos_token_id  # pass as kwarg (do not mutate tok globally)
+                pad_id = int(tok.eos_token_id)
 
-            # --- GENERATION KWARGS (MINIMAL, EXPLICIT) ------------------------
+            # GENERATE (NO max_length; enforce max_new_tokens)
             gen_kwargs: Dict[str, Any] = {
                 "input_ids": input_ids,
+                "attention_mask": attention_mask,
                 "max_new_tokens": target_tokens,
                 "do_sample": True,
-                "top_p": float(getattr(llm, "top_p", kwargs.get("top_p", 0.95))),
-                "temperature": float(getattr(llm, "temperature", kwargs.get("temperature", 0.7))),
-                "use_cache": False,  # <-- KEY FIX: BYPASS cache_position PATH
+                "top_p": float(TOP_P),
+                "temperature": float(TEMPERATURE),
                 "pad_token_id": pad_id,
-                "attention_mask": attention_mask,
+                "use_cache": False,                 # BYPASS cache_position PATH
                 "return_dict_in_generate": True,
             }
-            # MERGE SAFE EXTRAS WITHOUT OVERRIDING CRITICAL GUARDS ------------
-            for k in ("repetition_penalty", "top_k", "min_new_tokens", "no_repeat_ngram_size"):
-                if k in kwargs and kwargs[k] is not None:
-                    gen_kwargs[k] = kwargs[k]
+            if isinstance(TOP_K, int) and TOP_K > 0:
+                gen_kwargs["top_k"] = int(TOP_K)
+            if isinstance(REPETITION_PENALTY, (int, float)) and float(REPETITION_PENALTY) != 1.0:
+                gen_kwargs["repetition_penalty"] = float(REPETITION_PENALTY)
+            if isinstance(NO_REPEAT_NGRAM_SIZE, int) and NO_REPEAT_NGRAM_SIZE > 0:
+                gen_kwargs["no_repeat_ngram_size"] = int(NO_REPEAT_NGRAM_SIZE)
 
-            # FINAL ASSERT: NO ZERO-LENGTH input_ids --------------------------
-            if gen_kwargs["input_ids"].shape[-1] == 0:
-                raise RuntimeError("Guard failed: input_ids has zero length before generate().")
-
-            # --- RUN GENERATION (SYNC) ----------------------------------------
             with torch.inference_mode():
                 out = model.generate(**gen_kwargs)
 
-            # --- DECODE: SLICE OFF PROMPT, SKIP SPECIALS ---------------------
-            prompt_len = input_ids.shape[-1]
-            # out may be dict-like (return_dict_in_generate=True)
             sequences = out.sequences if hasattr(out, "sequences") else out
-            new_tokens = sequences[:, prompt_len:] if sequences.shape[-1] > prompt_len else sequences
-            text = tok.decode(new_tokens[0], skip_special_tokens=True)
+            prompt_len = int(input_ids.shape[-1])
+            tail = sequences[:, prompt_len:] if sequences.shape[-1] > prompt_len else sequences
+            text = tok.decode(tail[0], skip_special_tokens=True).strip()
+            return text or "EMPTY RESPONSE FROM MODEL."
 
-            # === ACCOUNTING / METRICS (BEST-EFFORT) ==========================
-            streamed_text = text or ""
-            if not streamed_text.strip():
-                logger.warning("EMPTY RESPONSE — CHECK PROMPT OR TOKEN LIMITS.")
-                return "EMPTY RESPONSE FROM MODEL."
-
-            # TOKEN USAGE ACCOUNTING (PREFERS TIKTOKEN, FALLBACK WORD SPLIT)
-            try:
-                import tiktoken  # type: ignore
-                encoding = tiktoken.get_encoding("cl100k_base")
-                total_tokens = len(encoding.encode(streamed_text))
-            except Exception as e:
-                logger.warning(f"TIKTOKEN FAILED: {e} — FALLBACK TO WORD COUNT.")
-                total_tokens = len(streamed_text.split())
-
-            # PERF METRICS LOGGING
-            duration = time.time() - start_time
-            tokens_per_sec = total_tokens / duration if duration > 0 else 0
-            try:
-                run_count = (state_manager.get_state("run_count") or 0) + 1  # type: ignore[name-defined]
-                total_tokens_all = (state_manager.get_state("total_tokens_all") or 0) + total_tokens  # type: ignore[name-defined]
-                total_duration_all = (state_manager.get_state("total_duration_all") or 0.0) + duration  # type: ignore[name-defined]
-                state_manager.set_state("run_count", run_count)  # type: ignore[name-defined]
-                state_manager.set_state("total_tokens_all", total_tokens_all)  # type: ignore[name-defined]
-                state_manager.set_state("total_duration_all", total_duration_all)  # type: ignore[name-defined]
-                avg_tps = total_tokens_all / total_duration_all if total_duration_all > 0 else 0
-                logger.info(
-                    f"INFER TIME={duration:.2f}s | TOKENS={total_tokens} | "
-                    f"AVG_TPS={avg_tps:.2f} | CURR_TPS={tokens_per_sec:.2f}"
-                )
-            except Exception:
-                # STATE MANAGER OPTIONAL — DO NOT HARD FAIL ON METRICS
-                pass
-
-            return streamed_text.strip()
-
-        # === OPENAI-LIKE PATH (FALLBACK) =====================================
+        # ---------- OPENAI/REMOTE-LIKE PATH ----------
         complete = getattr(llm, "complete", None)
         if callable(complete):
-            resp = llm.complete(f"{system_prompt}\n{query}")
+            # Single string prompt; your system prompt already included above
+            resp = llm.complete(prompt, max_tokens=target_tokens)  # safe arg for most remote wrappers
             return (resp.text if hasattr(resp, "text") else str(resp)).strip()
 
         return "LLM BACKEND UNSUPPORTED FOR GENERATION."
 
-    # === OOM HANDLING: REDUCE TOKENS AND RECUR ===============================
-    except torch.cuda.OutOfMemoryError as e:
-        logger.warning(f"OOM DURING GENERATION — {e}. RETRYING WITH HALF TOKENS.")
-        clear_vram()
-        new_max = max(1, (target_tokens // 2))
-        if hasattr(llm, "max_new_tokens"):
-            llm.max_new_tokens = new_max
-        return generate(
-            query,
-            system_prompt,
-            llm,
-            max_new_tokens=new_max,
-            think=think,
-            depth=depth + 1,
-            **kwargs,
-        )
-
-    # === GENERIC FAILURE =====================================================
     except Exception as e:
-        error_msg = f"GENERATION FAILURE — {e}"
-        logger.error(error_msg)
-        return error_msg
+        logger.error(f"GENERATION FAILURE — {e}")
+        return f"GENERATION FAILURE — {e}"
 
-    # === ALWAYS CLEAR VRAM + RESTORE ORIGINAL STATE ==========================
     finally:
         clear_vram()
-        if max_new_tokens is not None and previous_max is not None and hasattr(llm, "max_new_tokens"):
-            llm.max_new_tokens = previous_max
-
+        if max_new_tokens is not None and prev_max is not None and hasattr(llm, "max_new_tokens"):
+            try:
+                llm.max_new_tokens = prev_max
+            except Exception:
+                pass
 
 
 __all__ = [
@@ -1057,8 +976,7 @@ __all__ = [
     "save_database",
     "load_database",
     "get_system_info",
-    "append_to_chatbot",
-    "PresencePenaltyLogitsProcessor", 
+    "append_to_chatbot", 
     "filtered_query_engine",
     "clear_ram",
     "fetch_openai_models",

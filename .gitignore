@@ -196,9 +196,6 @@ logs/
 # Private plugins (full dir to avoid any subfiles leaking)
 src/gia/plugins/
 
-# Unwanted/Sensitive Files
-.github/
-
 # Any other debug/temp files
 *.bak
 *.swp

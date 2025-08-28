@@ -15,11 +15,11 @@ requires-python = ">=3.11"
 
 dependencies = [
   "numpy>=2.3.2",
-  "torch>=2.7.1",
-  "transformers>=4.55.2,<4.56",
+  "torch==2.7.1",
+  "transformers==4.55.3",
   "gradio>=5.30.0",
   "chromadb==0.5.20",
-  "gptqmodel @ git+https://github.com/ModelCloud/GPTQModel.git@e130c18e3d7aab46508278771d2fccc9777be81e",
+  "gptqmodel @ git+https://github.com/ModelCloud/GPTQModel.git@v4.0.0-dev2",
   "llama-index @ git+https://github.com/run-llama/llama_index.git",
   "llama-index-vector-stores-chroma @ git+https://github.com/run-llama/llama_index.git#subdirectory=llama-index-integrations/vector_stores/llama-index-vector-stores-chroma",
   "llama-index-llms-huggingface-api @ git+https://github.com/run-llama/llama_index.git#subdirectory=llama-index-integrations/llms/llama-index-llms-huggingface-api",
@@ -30,6 +30,10 @@ dependencies = [
   "scipy==1.16.1",
   "sentence-transformers==5.1.0",
   "trafilatura==2.0.0",
+  "llama-index-llms-openai-like==0.5.0",
+  "llama-index-llms-openrouter==0.4.0",
+  "packaging>=20.9",
+
 ]
 
 

@@ -48,15 +48,8 @@ Follow these steps to install and run GIA.
 
    - **Using pip**:
      ```
-      pip install -r requirements.lock
-      pip install -e . --no-deps
-     ```
-
-   - **Using uv** (faster alternative):
-     ```
-      pip install uv
-      uv pip sync requirements.lock
-      uv pip install -e . --no-deps
+      python -m pip install -r requirements.lock
+      python -m pip install -e . --no-deps
      ```
 
 4. **Verify + Run**

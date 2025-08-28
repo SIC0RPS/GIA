@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 # DEFAULTS (used if config.toml missing/absent keys)
 DEFAULTS: Dict[str, Any] = {
     "CONTEXT_WINDOW": 32768,
-    "MAX_NEW_TOKENS": 4096,
+    "MAX_NEW_TOKENS": 2048,
     "TEMPERATURE": 0.7,
     "TOP_P": 0.8,
     "TOP_K": 20,
@@ -20,7 +20,7 @@ DEFAULTS: Dict[str, Any] = {
     "DEBUG": True,
     "MODEL_PATH": "~/models/quantized",
     "EMBED_MODEL_PATH": "~/models/bge-large-en-v1.5",
-    "DATA_PATH": "MyData",  # relative to PROJECT_ROOT (src/gia)
+    "DATA_PATH": "MyData",  
     "DB_PATH": "db",
     "QA_PROMPT": [
         "Context information is below.",
@@ -29,11 +29,9 @@ DEFAULTS: Dict[str, Any] = {
         "###",
         "{query_str}",
     ],
-    # >>> Authoritative default collection name <<<
     "COLLECTION_NAME": "GIA_db",
 }
 
-# Fallback system prompt (if config.toml lacks prompt.system_prompt)
 DEFAULT_SYSTEM_PROMPT = (
     "You are an expert assistant. Provide accurate, reliable, and evidence-based answers."
 )
