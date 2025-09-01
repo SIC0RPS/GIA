@@ -1,16 +1,14 @@
-# GIA: General Intelligence Assistant
+# GIA
 
-GIA is a local-first, extensible AI assistant designed for developers and power users. You can run it on your own hardware using local models or connect to online APIs like OpenAI (with dynamic model selection) and HuggingFace providers. It allows you to use your own data, build custom plugins, and run quantized models via GPTQModel.
-
-## What is GIA?
-
-GIA is a Python-based tool that combines large language models (LLMs), Retrieval-Augmented Generation (RAG), and plugins. It supports both a command-line interface (CLI) and a Gradio web UI. Your data remains local unless you choose to use online APIs or custom plugins that require external access. For security, API keys are managed exclusively through environment variables.
+GIA is a local first extensible AI assistant built for developers and power users. It runs on your own hardware with local models or connects to APIs like OpenAI HuggingFace and OpenRouter with dynamic model selection. You can work with your own data build custom plugins run quantized models via GPTQModel and load `.safetensors` models directly through the Gradio UI no coding required.
 
 ## Features
 
-- **LLM Inference Options**: Run models locally (using GPTQ for pre-quantized models) or online via HuggingFace (serverless with explicit providers or automatic curated order), OpenAI (all models supported with api_base), or OpenRouter.
-- **RAG Support**: Integrate your own files and databases for context-aware responses.
-- **Plugin System**: Easily add new features by creating Python files.
+- **Models**: Local GPTQ (via GPTQModel) or remote (HuggingFace Inference, OpenAI, OpenRouter).
+- **RAG Support**: Use your .pdf files or .txt for context-aware responses.
+- **UI**: Gradio chat; optional CLI mode mirrors chat behavior.
+- **Plugins**: Drop a file in `src/gia/plugins/<name>/<name>.py` and call it via `.<name>`.
+- **Keys**: Read from environment variables only.
 - **Synced Interfaces**: Use CLI or web UI interchangeably—sessions stay in sync.
 - **Resource Management**: Optimized for long-running operations without excessive resource consumption.
 
@@ -125,7 +123,7 @@ GIA starts by loading your selected model (local or online), any RAG database, a
 - Plugins execute in separate threads to prevent crashes from affecting the main application.
 - Data remains local by default, except when using online APIs or plugins that explicitly send data externally.
 - **OpenAI**: Uses OPENAI_API_KEY for authentication; supports dynamic selection from all available models and api_base for custom endpoints.
-- **HuggingFace**: Uses HF_TOKEN for authentication; provides serverless inference without local downloads—select an explicit provider or let it automatically try a curated list.
+- **HuggingFace**: Uses HF_TOKEN for authentication; provides serverless inference without local downloads, select an explicit provider or let it automatically try a curated list.
 - **Local Models**: Employs GPTQModel for pre-quantized models, wrapped as a HuggingFaceLLM.
 - **Security**: API keys are read only from environment variables (HF_TOKEN, OPENAI_API_KEY, OPENROUTER_API_KEY); no logging of secrets.
 - **Database**: For RAG, place text files in the MyData folder, then use the `.create` command in chat (or upcoming UI button) to build a ChromaDB database.
