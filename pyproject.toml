@@ -7,7 +7,7 @@ allow-direct-references = true
 
 [project]
 name = "GIA"
-version = "0.0.9"
+version = "0.1.0"
 authors = [{ name = "SICORPS" }]
 description = "Local-first AI assistant with LLM, RAG, and plugins. Supports local GPTQ models, HuggingFace, OpenAI, and OpenRouter APIs."
 readme = "README.md"
