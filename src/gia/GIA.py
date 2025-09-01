@@ -2,24 +2,24 @@
 import sys
 import os
 import importlib
+import tomllib
 import threading
 import inspect
 import json
 import logging
 import gc
+import re
+import shutil
 import hashlib
 import traceback
 import argparse
 import time
-import sys
 import asyncio
 import shlex
-import threading
 import torch
 import gradio as gr
-from functools import partial
-from queue import Empty
-from types import GeneratorType
+import chromadb
+from transformers import TextIteratorStreamer
 from functools import partial
 from datetime import datetime
 from rich.console import Console
@@ -30,22 +30,13 @@ from pathlib import Path
 from colorama import Style, Fore
 from logging.handlers import QueueHandler, QueueListener
 from queue import Queue, Empty
-from typing import Dict, Callable, List, Generator, Optional, Tuple, Any, Union
-from gptqmodel import GPTQModel
+from typing import Dict, Callable, List, Generator, Optional, Tuple, Any, Union, Tuple
 from colorama import init
-init(autoreset=True)
-
-from llama_index.llms.huggingface import HuggingFaceLLM
-from llama_index.llms.openai import OpenAI as LlamaOpenAI
-from llama_index.llms.huggingface_api import HuggingFaceInferenceAPI
-from llama_index.core import Settings
 
 from gia.config import CONFIG, PROJECT_ROOT, system_prefix
 from gia.core.logger import logger, log_banner
-from gia.core.state import ( load_state, ProjectState, state_manager )
+from gia.core.state import load_state, ProjectState, state_manager
 from gia.core.utils import (
-    generate,
-    clear_vram,
     save_database,
     load_database,
     get_system_info,
@@ -55,6 +46,7 @@ from gia.core.utils import (
     fetch_openai_models,
 )
 
+init(autoreset=True)
 
 CONTEXT_WINDOW = CONFIG["CONTEXT_WINDOW"]
 MAX_NEW_TOKENS = CONFIG["MAX_NEW_TOKENS"]
@@ -69,6 +61,243 @@ DB_PATH = CONFIG["DB_PATH"]
 DEBUG = CONFIG["DEBUG"]
 chat_history = []
 log_banner(__file__)
+
+#DB CFG START
+ACTIVE_DB_PATH: str = DB_PATH
+CHROMA_CLIENT: Optional[chromadb.PersistentClient] = None  # type: ignore[attr-defined]
+
+_VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+
+
+def _ensure_client() -> chromadb.PersistentClient:  # type: ignore[override]
+    """Ensure a Chroma PersistentClient is initialized at ACTIVE_DB_PATH."""
+    global CHROMA_CLIENT
+    if CHROMA_CLIENT is None:
+        os.makedirs(ACTIVE_DB_PATH, exist_ok=True)
+        CHROMA_CLIENT = _init_chroma_at_path(ACTIVE_DB_PATH)
+    return CHROMA_CLIENT
+
+
+def _is_valid_db_name(name: str) -> bool:
+    """Validate DB name for safe subfolder creation (no traversal)."""
+    return bool(_VALID_NAME_RE.fullmatch(name))
+
+def _name_from_path(path: str) -> str:
+    """Turn a path into a canonical UI name."""
+    base = os.path.normpath(DB_PATH)
+    path = os.path.normpath(path)
+    if path == base:
+        return "(base)"
+    return os.path.basename(path)
+
+def _init_chroma_at_path(path: str) -> chromadb.PersistentClient:  # type: ignore[override]
+    """Initialize a Chroma PersistentClient at the given path."""
+    client = chromadb.PersistentClient(path=path)  # type: ignore[attr-defined]
+    # Light sanity ping; also ensures on-disk init
+    try:
+        client.heartbeat()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Chroma heartbeat failed at %s: %s", path, exc)
+    return client
+
+
+def ui_refresh_db_list() -> Tuple[Any, str]:
+    """
+    Refresh the dropdown with real Chroma collections at ACTIVE_DB_PATH.
+
+    Returns:
+        (gr.update(choices=<collections>, value=<active or first>), status_message)
+    """
+    client = _ensure_client()
+    names: List[str] = []
+    try:
+        cols = client.list_collections()
+        for c in cols:
+            nm = getattr(c, "name", None)
+            if nm is None and isinstance(c, dict):
+                nm = c.get("name")
+            if nm:
+                names.append(str(nm))
+    except Exception as exc:
+        logger.error("Failed to list Chroma collections: %s", exc)
+    names = sorted(set(names), key=str.lower)
+
+    active = None
+    try:
+        active = state_manager.get_state("COLLECTION_NAME") or None
+    except Exception:
+        active = None
+    value = active if active in names else (names[0] if names else None)
+
+    msg = f"Detected {len(names)} collection(s) in active DB."
+    logger.info("Refreshed collections: %s (active=%s)", names, value)
+    return gr.update(choices=names, value=value), msg
+
+
+def ui_create_db(new_name: str) -> Tuple[Any, str, str]:
+    """
+    Create a new Chroma collection under ACTIVE_DB_PATH.
+    Returns: (dropdown update, status message, cleared new_name)
+    """
+    name = (new_name or "").strip()
+    if not _is_valid_db_name(name):
+        return (
+            gr.update(),
+            "Invalid name. Use 1–64 chars: A-Z, a-z, 0-9, _ or -.",
+            new_name,
+        )
+
+    client = _ensure_client()
+    try:
+        # Create (or get) the collection so it's immediately available
+        client.get_or_create_collection(name=name, metadata={"hnsw:space": "cosine"})
+        logger.info("Created collection '%s'", name)
+    except Exception as exc:
+        logger.error("Failed creating collection '%s': %s", name, exc)
+        return gr.update(), f"Error creating collection '{name}': {exc}", new_name
+
+    # Refresh list and select the new collection
+    update, _ = ui_refresh_db_list()
+    return update, f"Collection '{name}' created.", ""
+
+def _resolve_collection_name() -> str:
+    """
+    Resolve the Chroma collection name with this precedence:
+      1) Runtime override from state_manager ('COLLECTION_NAME')
+      2) [database].collection_name in config.toml
+      3) CONFIG["COLLECTION_NAME"]
+      4) hard default "GIA_db"
+    Enforces 3..63 chars.
+    """
+    # 1) Runtime override
+    try:
+        override = state_manager.get_state("COLLECTION_NAME")
+        if isinstance(override, str) and override.strip():
+            name = override.strip()
+            n = len(name)
+            if 3 <= n <= 63:
+                return name
+            logger.warning("(CFG) Override collection_name length %d invalid; ignoring", n)
+    except Exception as e:
+        logger.debug(f"(CFG) Could not read COLLECTION_NAME override: {e}")
+
+    # 2) config.toml
+    cfg_path = PROJECT_ROOT.parent.parent / "config.toml"
+    name_from_toml = None
+    try:
+        if cfg_path.exists():
+            with cfg_path.open("rb") as f:
+                _cfg = tomllib.load(f)
+            name_from_toml = (
+                _cfg.get("database", {}).get("collection_name", None)
+                if isinstance(_cfg, dict)
+                else None
+            )
+    except Exception as e:
+        logger.warning(f"(CFG) Failed reading config.toml for collection_name: {e}")
+
+    # 3) CONFIG then 4) default
+    name = name_from_toml or CONFIG.get("COLLECTION_NAME") or "GIA_db"
+
+    # Validate & sanitize
+    if not isinstance(name, str):
+        logger.warning("(CFG) COLLECTION_NAME not a string; using 'GIA_db'")
+        name = "GIA_db"
+    n = len(name)
+    if n < 3 or n > 63:
+        logger.warning("(CFG) COLLECTION_NAME length %d invalid; using 'GIA_db'", n)
+        name = "GIA_db"
+
+    return name
+
+def ui_load_db(selected_name: str) -> str:
+    """
+    Select the active Chroma collection name for subsequent DB operations.
+    Does not build the query engine (that's done by load_database_wrapper()).
+    """
+    name = (selected_name or "").strip()
+    if not name:
+        return "Error: No collection selected."
+
+    client = _ensure_client()
+    try:
+        # Validate it exists
+        client.get_collection(name=name)
+    except Exception as exc:
+        logger.error("Load collection '%s' failed: %s", name, exc)
+        return f"Error: Collection '{name}' not found."
+
+    # Set the active collection override for utils._resolve_collection_name()
+    try:
+        state_manager.set_state("COLLECTION_NAME", name)
+    except Exception as exc:
+        logger.debug("Failed to set active collection in state: %s", exc)
+
+    msg = f"Selected collection: {name}"
+    logger.info(msg)
+    return msg
+
+
+def ui_delete_db(selected_name: str, confirm_text: str) -> Tuple[Any, str, str]:
+    """
+    Delete a Chroma collection by name.
+    Requires confirm_text == 'DELETE'.
+    Returns: (dropdown update, status message, cleared confirm_text)
+    """
+    if (confirm_text or "").strip().upper() != "DELETE":
+        return gr.update(), "Type DELETE to confirm.", confirm_text
+
+    name = (selected_name or "").strip()
+    if not name:
+        return gr.update(), "Error: No collection selected.", confirm_text
+
+    client = _ensure_client()
+    try:
+        client.delete_collection(name=name)
+        logger.info("Deleted collection '%s'", name)
+        # Clear active override if it was pointing at the deleted collection
+        try:
+            if state_manager.get_state("COLLECTION_NAME") == name:
+                state_manager.set_state("COLLECTION_NAME", None)
+                state_manager.set_state("DATABASE_LOADED", False)
+                state_manager.set_state("INDEX", None)
+                state_manager.set_state("QUERY_ENGINE", None)
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.error("Failed deleting collection '%s': %s", name, exc)
+        return gr.update(), f"Error deleting collection '{name}': {exc}", confirm_text
+
+    update, _ = ui_refresh_db_list()
+    return update, f"Collection '{name}' deleted.", ""
+
+def db_unload_handler(
+    state: Dict[str, Any],
+    chat_history: List[Dict[str, str]],
+) -> Tuple[List[Dict[str, str]], Dict[str, Any], str]:
+    """Unload the current database and disable the query engine."""
+    try:
+        # Clear shared state
+        state_manager.set_state("DATABASE_LOADED", False)
+        state_manager.set_state("INDEX", None)
+        state_manager.set_state("QUERY_ENGINE", None)
+        state_manager.set_state("COLLECTION_NAME", None)
+
+        # Reflect to Gradio state
+        state = state if isinstance(state, dict) else {}
+        state["database_loaded_gr"] = False
+        state["use_query_engine_gr"] = False
+        state["status_gr"] = "Database unloaded"
+
+        append_to_chatbot(chat_history, "Database unloaded.", metadata={"role": "assistant"})
+        logger.info("Database unloaded via UI")
+        return chat_history, state, "Database unloaded."
+    except Exception as e:
+        logger.error(f"db_unload_handler failed: {e}")
+        return (chat_history or []), (state or {}), f"Error: {e}"
+
+# DB CFG END
+
 
 class PluginSandbox:
     """Isolated sandbox for plugin execution using threading with cooperative stop.
@@ -122,12 +351,13 @@ class PluginSandbox:
         """Start the sandbox thread and logger listener.
 
         WHAT:
-            - SPAWN DAEMON THREAD TO EXECUTE THE PLUGIN.
-            - START A QueueListener TO FORWARD WORKER LOGS TO STDOUT.
+            - Spawn daemon thread to execute the plugin.
+            - Start a QueueListener that drains records without emitting to CLI.
         WHY:
-            - NON-BLOCKING UI + TERMINAL VISIBILITY.
+            - Keep CLI clean; all logs go to logger.py file handler (debug terminal tails them).
+            - Still drain the queue to avoid buildup, without duplicating outputs.
         """
-        # MIL: CREATE AND START WORKER THREAD
+        # Start worker thread
         self.thread = threading.Thread(
             target=self._run_func,
             args=(
@@ -143,8 +373,9 @@ class PluginSandbox:
         )
         self.thread.start()
 
-        # MIL: LISTENER WRITES TO STDOUT; USE logging.MODULE API
-        handlers = [logging.StreamHandler(sys.stdout)]
+        # Drain log records without printing to the main terminal
+        # Root file handler (configured in logger.py) still captures everything.
+        handlers = [logging.NullHandler()]
         self.listener = QueueListener(self.logger_queue, *handlers)
         self.listener.start()
 
@@ -277,11 +508,13 @@ class PluginSandbox:
                 # MIL: NEVER RAISE ON CLEANUP
                 pass
 
+
 plugins: Dict[str, Callable] = {}
 module_mtimes: Dict[str, float] = {}
 plugins_dir_path: Path = PROJECT_ROOT / "plugins"
 active_sandboxes: Dict[str, PluginSandbox] = {}
 sandboxes_lock = threading.Lock()
+
 
 def format_json_for_chat(item: Any) -> str:
     """Pretty-print dict/list for chat display without looking like a 'history' blob."""
@@ -291,13 +524,14 @@ def format_json_for_chat(item: Any) -> str:
     except Exception:
         return str(item)
 
+
 def load_plugins() -> Dict[str, Callable]:
     """Load plugins from plugins/ directory for dynamic extensibility.
 
     Returns:
         Dict[str, callable]: Dictionary of plugin functions.
     """
-    global plugins, plugins_dir_path
+    global plugins
     plugins = {}
     if not plugins_dir_path.is_dir():
         logger.warning(f"Plugins directory not found: {plugins_dir_path}")
@@ -332,15 +566,19 @@ def load_plugins() -> Dict[str, Callable]:
     logger.info(f"(L.P) Loaded {len(plugins)} plugins: {list(plugins.keys())}")
     return plugins
 
+
 plugins = load_plugins()
 logger.info(f"(L.P) Loaded {len(plugins)} plugins: {list(plugins.keys())}")
 
-METADATA_TITLE = f"Generated by {PROJECT_ROOT.name.upper()}-{hash(PROJECT_ROOT) % 10000}"
+METADATA_TITLE = (
+    f"Generated by {PROJECT_ROOT.name.upper()}-{hash(PROJECT_ROOT) % 10000}"
+)
 dark_gray = Style.DIM + Fore.LIGHTBLACK_EX
 reset_style = Style.RESET_ALL
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG if CONFIG["DEBUG"] else logging.INFO)
-    
+
+
 def m_hash(filepath: str) -> str:
     """Compute SHA256 hash of a file.
 
@@ -356,6 +594,7 @@ def m_hash(filepath: str) -> str:
         for chunk in iter(lambda: file.read(4096), b""):
             hash_sha256.update(chunk)
     return hash_sha256.hexdigest()
+
 
 def handle_command(
     cmd: str,
@@ -417,8 +656,10 @@ def handle_command(
                 proceed = True
                 if not is_gradio:
                     try:
-                        confirm = input("Confirm delete database? (y/n): ").strip().lower()
-                        proceed = (confirm == "y")
+                        confirm = (
+                            input("Confirm delete database? (y/n): ").strip().lower()
+                        )
+                        proceed = confirm == "y"
                     except Exception:
                         proceed = False
                 if not proceed:
@@ -426,6 +667,7 @@ def handle_command(
                     return "Delete canceled."
                 try:
                     import shutil
+
                     shutil.rmtree(db_path)
                     state_manager.set_state("DATABASE_LOADED", False)
                     state_manager.set_state("INDEX", None)
@@ -440,7 +682,9 @@ def handle_command(
 
             if cmd_lower == ".unload":
                 msg = unload_model()
-                state_dict["status_gr"] = "Model unloaded" if "success" in msg.lower() else "Unload attempted"
+                state_dict["status_gr"] = (
+                    "Model unloaded" if "success" in msg.lower() else "Unload attempted"
+                )
                 return msg
 
         except Exception as e:
@@ -462,6 +706,25 @@ def handle_command(
 
     plugin_name = parts[0][1:].lower()
     optional_arg = parts[1] if len(parts) == 2 else None
+
+    # EARLY DEP CHECK FOR GENMASTER TO AVOID STARTING THE PLUGIN WHEN NOT READY
+    if plugin_name == "genmaster":
+        missing: List[str] = []
+        if app_state.LLM is None:
+            missing.append("llm")
+        if app_state.QUERY_ENGINE is None:
+            missing.append("query_engine")
+        if app_state.EMBED_MODEL is None:
+            missing.append("embed_model")
+        if missing:
+            msg = (
+                "Error: Missing dependencies for '.genmaster': "
+                + ", ".join(missing)
+                + ". Load a model and the DB first (.load)."
+            )
+            logger.error("(G.M) %s", msg)
+            return msg
+
     if plugin_name not in plugins:
         return f"Error: Plugin '{plugin_name}' not found."
 
@@ -473,20 +736,28 @@ def handle_command(
         "chat_history": chat_history,
     }
     sig = inspect.signature(plugin_func)
-    kwargs_to_pass: Dict[str, Any] = {k: v for k, v in available_kwargs.items() if k in sig.parameters}
+    kwargs_to_pass: Dict[str, Any] = {
+        k: v for k, v in available_kwargs.items() if k in sig.parameters
+    }
     if optional_arg is not None:
         if "arg" in sig.parameters:
             kwargs_to_pass["arg"] = optional_arg
         elif "query" in sig.parameters:
             kwargs_to_pass["query"] = optional_arg
-
     try:
         sig.bind_partial(**kwargs_to_pass)
         missing = [
-            p for p, param in sig.parameters.items()
-            if (param.default is inspect._empty and
-                param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY) and
-                p not in kwargs_to_pass)
+            p
+            for p, param in sig.parameters.items()
+            if (
+                param.default is inspect._empty
+                and param.kind
+                in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                )
+                and p not in kwargs_to_pass
+            )
         ]
         if missing:
             return f"Error: Plugin '{plugin_name}' missing required args: {', '.join(missing)}"
@@ -509,25 +780,50 @@ def handle_command(
                     if (time.time() - start) > max_seconds:
                         raise TimeoutError(f"Plugin '{plugin_name}' timed out after {max_seconds}s")
                     continue
+
                 if item is None:
                     break
                 if isinstance(item, BaseException):
                     raise item
+
+                # Normalize to list[dict] and stamp metadata: plugin + title
                 if isinstance(item, list) and all(isinstance(d, dict) for d in item):
-                    yield item
-                    continue
-                try:
-                    text = format_json_for_chat(item) if isinstance(item, (dict, list)) else str(item)
-                except Exception:
-                    text = str(item)
-                if text:
-                    yield text
+                    msgs = item
+                elif isinstance(item, dict):
+                    msgs = [item]
+                else:
+                    # Fallback: render as text, wrap into a single assistant message
+                    try:
+                        text = format_json_for_chat(item) if isinstance(item, (dict, list)) else str(item)
+                    except Exception:
+                        text = str(item)
+                    msgs = [{"role": "assistant", "content": (text or "").strip(), "metadata": {}}]
+
+                # Stamp plugin and default title into metadata; ensure role/content sane
+                out: List[Dict[str, Any]] = []
+                for m in msgs:
+                    role = (m.get("role") or "assistant").strip().lower()
+                    content = str(m.get("content", "")).strip()
+                    if not content:
+                        continue
+                    meta = m.get("metadata") or {}
+                    if not isinstance(meta, dict):
+                        meta = {}
+                    meta.setdefault("plugin", plugin_name)
+                    meta.setdefault("title", METADATA_TITLE)
+                    out.append({"role": role, "content": content, "metadata": meta})
+
+                if out:
+                    yield out
         finally:
             sandbox.stop()
             with sandboxes_lock:
                 active_sandboxes.pop(plugin_name, None)
 
+
     return _stream()
+
+
 
 def process_input(
     user_text: str,
@@ -573,16 +869,17 @@ def process_input(
                 yield out
             return
 
-        # MIL: APPEND MESSAGES INSTEAD OF REPLACING HISTORY TO AVOID DATA LOSS.
         if isinstance(result, list) and all(isinstance(d, dict) for d in result):
             for m in result:
                 role = (m.get("role") or "assistant").strip().lower()
                 content = (m.get("content") or "").strip()
                 if not content:
                     continue
-                append_to_chatbot(chat_history, content, metadata={"role": role})
+                meta = m.get("metadata") or {}
+                append_to_chatbot(chat_history, content, metadata={"role": role, **meta})
                 yield list(chat_history)
             return
+
 
         if isinstance(result, str):
             for out in _emit_chunk(result):
@@ -596,7 +893,8 @@ def process_input(
                     content = (m.get("content") or "").strip()
                     if not content:
                         continue
-                    append_to_chatbot(chat_history, content, metadata={"role": role})
+                    meta = m.get("metadata") or {}
+                    append_to_chatbot(chat_history, content, metadata={"role": role, **meta})
                     yield list(chat_history)
             else:
                 for out in _emit_chunk(str(item)):
@@ -647,13 +945,37 @@ def process_input(
     except Exception:
         _HFL_TYPE = tuple()  # type: ignore[assignment]
 
-    if isinstance(llm, _HFL_TYPE) and hasattr(llm, "_model") and hasattr(llm, "_tokenizer"):
-        import torch, threading
+    if isinstance(llm, _HFL_TYPE):
         from transformers import TextIteratorStreamer
 
-        model = llm._model
-        tok = llm._tokenizer
-        device = getattr(model, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        # MIL: SUPPORT BOTH PRIVATE AND PUBLIC ATTR NAMES
+        model = getattr(llm, "_model", None) or getattr(llm, "model", None)
+        tok = getattr(llm, "_tokenizer", None) or getattr(llm, "tokenizer", None)
+        if model is None or tok is None:
+            for out in _emit_chunk("Error: HuggingFaceLLM missing model/tokenizer."):
+                yield out
+            return
+
+        # Prefer tokenizer's chat template when available to induce correct EOS usage
+        try:
+            if hasattr(tok, "apply_chat_template"):
+                messages = []
+                if sys_pfx:
+                    messages.append({"role": "system", "content": sys_pfx})
+                messages.append({"role": "user", "content": text})
+                tmpl = tok.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                if isinstance(tmpl, str) and tmpl.strip():
+                    prompt = tmpl
+        except Exception as e:
+            logger.debug(f"(PI) chat template apply failed: {e}")
+
+        device = getattr(
+            model,
+            "device",
+            torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        )
 
         enc = tok(prompt, return_tensors="pt", add_special_tokens=True)
         ids = enc.get("input_ids")
@@ -681,7 +1003,10 @@ def process_input(
 
         # Pad id (no global mutation)
         try:
-            if getattr(tok, "pad_token_id", None) is None and getattr(tok, "eos_token_id", None) is not None:
+            if (
+                getattr(tok, "pad_token_id", None) is None
+                and getattr(tok, "eos_token_id", None) is not None
+            ):
                 tok.pad_token_id = int(tok.eos_token_id)
         except Exception:
             pass
@@ -693,30 +1018,52 @@ def process_input(
         try:
             if hasattr(llm, "max_new_tokens"):
                 llm.max_new_tokens = target_tokens
-            if hasattr(llm, "generate_kwargs") and isinstance(llm.generate_kwargs, dict):
-                llm.generate_kwargs["max_new_tokens"] = target_tokens
+            # MIL: SANITIZE WRAPPER GENERATE_KWARGS TO AVOID DUPLICATE max_new_tokens MERGE IN LlamaIndex
+            if hasattr(llm, "generate_kwargs") and isinstance(
+                llm.generate_kwargs, dict
+            ):
+                # REMOVE POTENTIAL CONFLICT KEYS THAT LlamaIndex MAY ALSO SET EXPLICITLY
+                llm.generate_kwargs.pop("max_new_tokens", None)
                 llm.generate_kwargs.pop("max_length", None)
         except Exception:
-            # MIL: SOFT-FAIL; DO NOT BLOCK GENERATION IF WRAPPER ATTRS DIFFER.
             pass
 
         gen_kwargs = {
             "input_ids": ids,
             "attention_mask": attn,
-            "max_new_tokens": target_tokens,  # MIL: CONFIG-DRIVEN; FIXES EARLY CUT-OFF.
+            "max_new_tokens": target_tokens,
             "do_sample": True,
             "top_p": float(TOP_P),
             "temperature": float(TEMPERATURE),
-            # break 4.55 bug path:
-            "use_cache": False,  # MIL: SAFETY—BYPASS cache_position PATH; PERF: SMALL HIT, STABILITY WIN.
-            # or: "cache_implementation": "static",
-            "pad_token_id": int(getattr(tok, "pad_token_id", getattr(tok, "eos_token_id", 0))),
+            "use_cache": False,
+            "pad_token_id": int(
+                getattr(tok, "pad_token_id", getattr(tok, "eos_token_id", 0))
+            ),
             "streamer": streamer,
         }
 
-        # kick generation in a thread
+        # Dynamic EOS: stop as soon as EOS is produced (if available)
+        try:
+            eos_tok = getattr(tok, "eos_token_id", None)
+            if eos_tok is None:
+                eos_tok = getattr(tok, "pad_token_id", None)
+            if eos_tok is not None:
+                gen_kwargs["eos_token_id"] = int(eos_tok)
+        except Exception:
+            pass
+
+        # Anti-repetition controls from config.toml
+        if isinstance(TOP_K, int) and TOP_K > 0:
+            gen_kwargs["top_k"] = int(TOP_K)
+        if (
+            isinstance(REPETITION_PENALTY, (int, float))
+            and float(REPETITION_PENALTY) != 1.0
+        ):
+            gen_kwargs["repetition_penalty"] = float(REPETITION_PENALTY)
+        if isinstance(NO_REPEAT_NGRAM_SIZE, int) and NO_REPEAT_NGRAM_SIZE > 0:
+            gen_kwargs["no_repeat_ngram_size"] = int(NO_REPEAT_NGRAM_SIZE)
+
         def _run():
-            # MIL: INFERENCE MODE FOR PERF; DISABLES GRAD.
             with torch.inference_mode():
                 model.generate(**gen_kwargs)
 
@@ -735,8 +1082,8 @@ def process_input(
         if streamed_any:
             return
 
-        # No tokens streamed -> fall back to single shot
-        from gia.core.utils import generate as _gen_safe
+        from gia.core.utils import stream_generate as _gen_safe
+
         text_out = _gen_safe(text, sys_pfx, llm)
         for out in _emit_chunk(text_out):
             yield out
@@ -748,7 +1095,11 @@ def process_input(
         try:
             streamed = False
             for ev in stream_complete(prompt):
-                delta = ev if isinstance(ev, str) else (getattr(ev, "delta", None) or getattr(ev, "text", ""))
+                delta = (
+                    ev
+                    if isinstance(ev, str)
+                    else (getattr(ev, "delta", None) or getattr(ev, "text", ""))
+                )
                 if not delta:
                     continue
                 streamed = True
@@ -757,12 +1108,13 @@ def process_input(
             if streamed:
                 return
         except Exception as exc:
-            logger.warning(f"[PI] stream_complete failed; switching to complete(). err={exc}")
+            logger.warning(
+                f"[PI] stream_complete failed; switching to complete(). err={exc}"
+            )
 
     complete = getattr(llm, "complete", None)
     if callable(complete):
         try:
-            # DO NOT pass extra kwargs like 'use_cache' here
             resp = llm.complete(prompt)
             text_out = getattr(resp, "text", None) or str(resp)
             for out in _emit_chunk(text_out):
@@ -794,16 +1146,16 @@ def list_all_folders(folder: str) -> List[str]:
         if os.path.isdir(os.path.join(folder, d))
     ]
 
-def update_model_dropdown(directory: str) -> Tuple[gr.Dropdown, List[Dict[str, str]]]:
+
+def update_model_dropdown(directory: str) -> Tuple[Any, List[Dict[str, str]]]:
     """Update model dropdown with available folders.
 
     Args:
         directory (str): Directory to scan for models.
 
     Returns:
-        Tuple[gr.Dropdown, List[Dict[str, str]]]: Updated dropdown and chat message.
+        Tuple[Any, List[Dict[str, str]]]: gr.update(...) for dropdown and chat message.
     """
-    # TO VALIDATE DIRECTORY
     directory = os.path.expanduser(directory)
     if not os.path.isdir(directory):
         return gr.update(choices=[]), [
@@ -812,10 +1164,18 @@ def update_model_dropdown(directory: str) -> Tuple[gr.Dropdown, List[Dict[str, s
                 "content": f"Error: Directory '{directory}' does not exist.",
             }
         ]
+
     folders = list_all_folders(directory)
-    return gr.update(choices=folders, value=folders[0] if folders else None), [
-        {"role": "assistant", "content": f"Found {len(folders)} model folders."}
+    names = [os.path.basename(os.path.normpath(p)) for p in folders]
+    try:
+        state_manager.set_state("LOCAL_MODELS_MAP", dict(zip(names, folders)))
+    except Exception as e:
+        logger.debug(f"(UI) Failed to store LOCAL_MODELS_MAP: {e}")
+
+    return gr.update(choices=names, value=(names[0] if names else None)), [
+        {"role": "assistant", "content": f"Found {len(names)} model folders."}
     ]
+
 
 def finalize_model_selection(
     mode: str,
@@ -828,32 +1188,37 @@ def finalize_model_selection(
         state: Gradio state dictionary.
 
     Returns:
-        Tuple[str, Dict]: Status message and updated state.
+        Tuple[str, Dict]: Status message (Markdown) and updated state.
     """
-    # UNLOAD PREVIOUS MODEL
     try:
         unload_model()
         logger.info("Previous model unloaded successfully")
     except Exception as e:
         logger.warning(f"Unload previous model failed: {str(e)}. Proceeding with load.")
 
-    # LOAD STATE
-    app_state = load_state()
     if not isinstance(state, dict):
         logger.error("Invalid state: expected dictionary")
         state = {}
         return "Error: Invalid state provided", state
 
-    # SET MODE IN STATE
     state_manager.set_state("MODE", mode)
     logger.info(f"Model mode set to {mode} globally")
 
-    # CONFIGURE MODEL PARAMETERS
-    config = {}
+    config: Dict[str, Any] = {}
     if mode == "Local":
-        config["model_path"] = state.get("model_path_gr", CONFIG["MODEL_PATH"])
+        selected = state.get("model_path_gr", "") or CONFIG["MODEL_PATH"]
+        resolved_path: Optional[str] = None
+        try:
+            mapping = state_manager.get_state("LOCAL_MODELS_MAP", {}) or {}
+            if isinstance(mapping, dict) and selected in mapping:
+                resolved_path = mapping[selected]
+        except Exception as e:
+            logger.debug(f"(UI) LOCAL_MODELS_MAP resolution failed: {e}")
+        config["model_path"] = resolved_path or selected
     elif mode == "HuggingFace":
-        config["model_name"] = state.get("hf_model_name", "mistralai/Mistral-7B-Instruct-v0.2")
+        config["model_name"] = state.get(
+            "hf_model_name", "mistralai/Mistral-7B-Instruct-v0.2"
+        )
     elif mode == "OpenAI":
         config["model_name"] = state.get("openai_model_name", "gpt-4o")
     elif mode == "OpenRouter":
@@ -864,19 +1229,99 @@ def finalize_model_selection(
         state["status_gr"] = error_msg
         return error_msg, state
 
-    # LOAD MODEL
     try:
         msg, llm = load_llm(mode, config)
-        if llm:
-            state_manager.set_state("LLM", llm)
-            state_manager.set_state("MODEL_NAME", config.get("model_name", config.get("model_path")))
-            state_manager.set_state("MODEL_PATH", config.get("model_path", ""))
-            state["status_gr"] = f"{mode} model loaded: {state_manager.get_state('MODEL_NAME')}"
-            state["model_loaded_gr"] = True
-            logger.info(f"Loaded LLM type: {type(llm).__name__} for mode {mode}")
-            return state["status_gr"], state
-        else:
+        if not llm:
             raise RuntimeError(msg)
+
+        state_manager.set_state("LLM", llm)
+        raw_name = config.get("model_name", config.get("model_path", "Unknown Model"))
+        display_name = (
+            os.path.basename(os.path.normpath(raw_name)) if mode == "Local" else str(raw_name)
+        )
+        state_manager.set_state("MODEL_NAME", display_name)
+        state_manager.set_state("MODEL_PATH", config.get("model_path", ""))
+
+        # Project name/version for header
+        proj_name, proj_ver = "GIA", "0.0.0"
+        try:
+            import tomllib  # Python 3.11+ stdlib
+            py_path = PROJECT_ROOT.parent.parent / "pyproject.toml"
+            if py_path.exists():
+                with py_path.open("rb") as f:
+                    data = tomllib.load(f)
+                if isinstance(data, dict):
+                    proj = data.get("project", {}) or {}
+                    if isinstance(proj, dict):
+                        proj_name = str(proj.get("name", proj_name))
+                        proj_ver = str(proj.get("version", proj_ver))
+        except Exception as e:
+            logger.debug(f"pyproject read failed: {e}")
+
+        # Hardware detection: show either GPU or CPU (never both)
+        cpu_name = "Unknown CPU"
+        try:
+            cpuinfo_path = "/proc/cpuinfo"
+            if os.path.exists(cpuinfo_path):
+                with open(cpuinfo_path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if line.lower().startswith("model name"):
+                            parts = line.split(":", 1)
+                            if len(parts) == 2:
+                                cpu_name = parts[1].strip()
+                                break
+            if cpu_name == "Unknown CPU":
+                import platform
+                cpu_name = platform.processor() or cpu_name
+        except Exception as e:
+            logger.debug(f"CPU name detection failed: {e}")
+
+        gpu_name: Optional[str] = None
+        try:
+            if torch.cuda.is_available():
+                gpu_name = torch.cuda.get_device_name(0)
+        except Exception as e:
+            logger.debug(f"GPU name detection failed: {e}")
+
+        # Status header as Markdown H3
+        if mode == "Local":
+            loaded_on = f"Loaded on: GPU: {gpu_name}" if gpu_name else f"Loaded on: CPU: {cpu_name}"
+            status_header = f"### {proj_name} v.{proj_ver} - Local model: {display_name} - {loaded_on}"
+        else:
+            # Online providers: concise header; hardware not applicable
+            status_header = f"### {proj_name} v.{proj_ver} - {mode} model: {display_name}"
+
+        # Database Config — reflect live active collection (not config)
+        active_collection: Optional[str] = None
+        try:
+            active_collection = state_manager.get_state("COLLECTION_NAME") or None
+        except Exception:
+            active_collection = None
+        if active_collection is None:
+            # Fallback: show first available collection if none selected yet
+            try:
+                client = _ensure_client()
+                cols = client.list_collections()
+                if cols:
+                    c0 = cols[0]
+                    active_collection = getattr(c0, "name", None) or (
+                        c0.get("name") if isinstance(c0, dict) else None
+                    )
+            except Exception:
+                active_collection = None
+
+        db_md = (
+            f"\n\n#### Database Config\n"
+            f"- Base path: `{DB_PATH}`\n"
+            f"- Collection: `{active_collection or 'none'}`"
+        )
+        status_header += db_md
+
+        state["status_gr"] = status_header
+        state["model_loaded_gr"] = True
+        logger.info(f"Loaded LLM type: {type(llm).__name__} for mode {mode}")
+        return status_header, state
+
     except Exception as e:
         error_msg = f"Failed to load {mode} model: {str(e)}"
         logger.error(error_msg)
@@ -884,19 +1329,47 @@ def finalize_model_selection(
         state["model_loaded_gr"] = False
         return error_msg, state
 
+
+
+def db_load_handler(
+    selected_name: str,
+    state: Dict[str, Any],
+    chat_history: List[Dict[str, str]],
+) -> Tuple[List[Dict[str, str]], Dict[str, Any], str]:
+    """Set the active DB to the selected name and load the query engine.
+
+    Returns:
+        Tuple[chat_history, updated_state, status_markdown]
+    """
+    try:
+        # 1) Switch active DB folder ('(base)' => DB_PATH)
+        msg1 = ui_load_db(selected_name)
+
+        # 2) Build/load the DB + QueryEngine with current LLM
+        updated_chat, updated_state = handle_load_button(state)
+        status_line = (updated_state.get("status_gr") or "").strip()
+        combined = msg1 if msg1 else ""
+        if status_line:
+            combined = f"{combined}\n{status_line}" if combined else status_line
+
+        return updated_chat, updated_state, (combined or "Database action completed.")
+    except Exception as e:
+        logger.error(f"db_load_handler failed: {e}")
+        return chat_history or [], (state or {}), f"Error: {e}"
+
+
 def chat_fn(
     message: str,
     chat_history: List[Dict[str, str]],
     state: Dict[str, Any],
-) -> Generator[Tuple[str, List[Dict[str, str]], Dict[str, Any]], None, None]:
+) -> "Generator[Tuple[str, Any, Dict[str, Any]], None, None]":
     """
     GRADIO CHAT BRIDGE (MINIMAL, RELIABLE).
 
-    - APPENDS USER BUBBLE (EXCEPT DOT-COMMANDS), CLEARS TEXTBOX.
-    - FORWARDS process_input() STREAM AS Chatbot UPDATES.
-    - RETURNS TRIPLES: (textbox_value, chatbot_value, state).
+    - Appends user bubble (except dot-commands), clears textbox.
+    - Forwards process_input() stream as Chatbot updates.
+    - Yields: (textbox_value, gr.update(...), state).
     """
-    # MIL: DEFENSIVE NORMALIZATION — STABLE TYPES FOR UI PIPELINE.
     chat_history = chat_history if isinstance(chat_history, list) else []
     state = state if isinstance(state, dict) else {}
 
@@ -905,101 +1378,158 @@ def chat_fn(
         yield "", gr.update(value=list(chat_history)), state
         return
 
-    # MIL: AVOID HISTORY POLLUTION FOR COMMANDS.
     is_command = msg.startswith(".")
     if not is_command:
         append_to_chatbot(chat_history, msg, metadata={"role": "user"})
-        # MIL: IMMEDIATE UI UPDATE + CLEAR TEXTBOX.
         yield "", gr.update(value=list(chat_history)), state
 
-    # MIL: STREAM ASSISTANT OUTPUT; COMMANDS ALSO EMIT FIRST UPDATE HERE.
     for updated_history in process_input(msg, state, chat_history):
         yield "", gr.update(value=updated_history), state
 
-def handle_load_button(state: Dict[str, Any]) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
-    """Handle load button action with early initialization and deduplication.
 
-    Args:
-        state: Application state dictionary.
+def handle_load_button(
+    state: Dict[str, Any],
+) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
+    """Handle load button: ensure correct local path resolution, then load DB.
 
-    Returns:
-        Tuple[List[Dict[str, str]], Dict[str, Any]]: Updated chat history, updated state dict.
+    Returns updated chatbot history and UI state, never raising to UI.
     """
-    # TO INITIALIZE CHAT HISTORY EARLY FOR ALL RETURNS
+    # MIL: ALWAYS RETURN A LIST (UI STABILITY)
     chat_history: List[Dict[str, str]] = []
 
-    # TO LOAD STATE
     app_state = load_state()
-    state_dict = state if isinstance(state, dict) else {
-        "use_query_engine_gr": True,
-        "status_gr": "",
-        "model_path_gr": None,
-        "database_loaded_gr": False,
-    }
+    state_dict = (
+        state
+        if isinstance(state, dict)
+        else {
+            "use_query_engine_gr": True,
+            "status_gr": "",
+            "model_path_gr": None,
+            "database_loaded_gr": False,
+        }
+    )
+
+    # MIL: NO-OP IF DB IS ALREADY LOADED (DEDUPLICATION)
     if state_dict.get("database_loaded_gr", False):
-        message = "Database already loaded."
-        if not chat_history or chat_history[-1].get("content") != message:
-            append_to_chatbot(chat_history, message, metadata={"role": "assistant"})
+        append_to_chatbot(
+            chat_history, "Database already loaded.", metadata={"role": "assistant"}
+        )
         return chat_history, state_dict
+
+    mode = str(state_dict.get("mode", "Local"))
     model_path_gr = state_dict.get("model_path_gr")
-    # For online modes, model_path_gr may be None, but database can still be loaded
+
     try:
-        if app_state.LLM is not None and (app_state.MODEL_PATH == model_path_gr or model_path_gr is None):
-            logger.info("(LOAD) LLM already loaded, skipping reload")
-        else:
-            logger.info(f"(LOAD) Loading model from {model_path_gr} as LLM is None or path mismatch")
-            # Use mode from state_dict
-            mode = state_dict.get("mode", "Local")
-            config = {"model_path": model_path_gr} if mode == "Local" else {}
+        if app_state.LLM is None:
+            config: Dict[str, Any] = {}
+            display_name: Optional[str] = None
+
+            if mode == "Local":
+                resolved_path: Optional[str] = None
+                mapping: Dict[str, str] = {}
+                try:
+                    mapping = state_manager.get_state("LOCAL_MODELS_MAP", {}) or {}
+                except Exception:
+                    mapping = {}
+
+                if isinstance(model_path_gr, str) and model_path_gr in mapping:
+                    resolved_path = mapping[model_path_gr]
+                elif isinstance(app_state.MODEL_PATH, str) and app_state.MODEL_PATH:
+                    resolved_path = app_state.MODEL_PATH
+                elif isinstance(model_path_gr, str) and model_path_gr:
+                    resolved_path = model_path_gr
+
+                if not resolved_path or not os.path.isdir(resolved_path):
+                    raise ValueError(
+                        "No valid local model directory resolved. "
+                        "Use 'Scan Directory' and 'Confirm Model' first."
+                    )
+
+                config = {"model_path": resolved_path}
+                display_name = os.path.basename(os.path.normpath(resolved_path))
+
+            elif mode == "HuggingFace":
+                mn = (
+                    state_dict.get("hf_model_name")
+                    or "mistralai/Mistral-7B-Instruct-v0.2"
+                )
+                config = {"model_name": mn}
+                display_name = str(mn)
+
+            elif mode == "OpenAI":
+                mn = state_dict.get("openai_model_name") or "gpt-4o"
+                config = {"model_name": mn}
+                display_name = str(mn)
+
+            elif mode == "OpenRouter":
+                mn = state_dict.get("openrouter_model_name") or "x-ai/grok-3-mini"
+                config = {"model_name": mn}
+                display_name = str(mn)
+
+            else:
+                raise ValueError(f"Invalid mode: {mode}")
+
+            logger.info(
+                "(LOAD) Loading model for mode=%s; target=%s",
+                mode,
+                config.get("model_path") or config.get("model_name"),
+            )
             msg, llm = load_llm(mode, config)
             if llm is None:
-                message = f"Error: Failed to load model: {msg}"
-                append_to_chatbot(chat_history, message, metadata={"role": "assistant"})
+                append_to_chatbot(
+                    chat_history,
+                    f"Error: Failed to load model: {msg}",
+                    metadata={"role": "assistant"},
+                )
                 return chat_history, state_dict
+
             state_manager.set_state("LLM", llm)
+            state_manager.set_state("MODEL_NAME", display_name)
+            if mode == "Local":
+                state_manager.set_state("MODEL_PATH", config["model_path"])
+            else:
+                state_manager.set_state("MODEL_PATH", None)
+
         result = load_database_wrapper(state_dict)
         message = str(result).strip()
-        if message and (not chat_history or chat_history[-1].get("content") != message):
+        if message:
             append_to_chatbot(chat_history, message, metadata={"role": "assistant"})
-        state_dict["use_query_engine_gr"] = True
-        state_dict["status_gr"] = "Database loaded"
-        state_dict["database_loaded_gr"] = True
+
+        ok = not message.lower().startswith("error")
+        state_dict["use_query_engine_gr"] = ok
+        state_dict["status_gr"] = "Database loaded" if ok else "Database load failed"
+        state_dict["database_loaded_gr"] = ok
+
     except Exception as e:
-        logger.error(f"Error during load button handling: {e}")
-        message = f"Error during loading: {str(e)}"
-        append_to_chatbot(chat_history, message, metadata={"role": "assistant"})
+        logger.error("Error during load button handling: %s", e)
+        append_to_chatbot(
+            chat_history, f"Error during loading: {e}", metadata={"role": "assistant"}
+        )
 
     return chat_history, state_dict
 
-def launch_app(args: argparse.Namespace) -> None:
-    """Launch Gradio application in a background thread (if not CLI-only) and run CLI loop in main thread.
 
-    Args:
-        args: Parsed command-line arguments, including --cli flag.
-    """
-    # EVENT FOR SIGNALING GRADIO LAUNCH COMPLETE
+def launch_app(args: argparse.Namespace) -> None:
+    """Launch Gradio application with fixed sidebars and full‑width chat."""
     launch_event = threading.Event()
 
-    # LAUNCH IN BACKGROUND THREAD FOR NON-BLOCKING TERMINAL
     def threaded_launch() -> None:
-        """Thread target to launch Gradio server, with demo built inside for thread-safe async init."""
-        # CREATE AND SET NEW EVENT LOOP FOR THIS THREAD
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-        # BUILD DEMO INSIDE THREAD TO BIND ASYNC EVENTS CORRECTLY
         with gr.Blocks(
             title=f"{tag()} - UI Gradio Interface",
             delete_cache=(60, 60),
-            theme = gr.themes.Base(
+            theme=gr.themes.Base(
                 primary_hue="zinc",
                 secondary_hue="stone",
                 neutral_hue="stone",
                 spacing_size="md",
                 radius_size="lg",
                 text_size="md",
-                font=[gr.themes.GoogleFont("Inter"), "ui-sans-serif", "system-ui", "sans-serif"],
-                font_mono=[gr.themes.GoogleFont("IBM Plex Mono"), "ui-monospace", "monospace"],
+                # Fonts
+                font=[gr.themes.GoogleFont("Roboto"), "ui-sans-serif", "system-ui", "sans-serif"],
+                font_mono=[gr.themes.GoogleFont("Google Sans Code"), "ui-monospace", "monospace"],
             ).set(
                 body_background_fill="#000000",
                 block_background_fill="#000000",
@@ -1018,78 +1548,103 @@ def launch_app(args: argparse.Namespace) -> None:
                 color_accent_soft="#111111",
                 table_border_color="#222222",
             ),
-            css = """
-            /* === FORCE PAGE BACKGROUND TO PURE BLACK === */
-            html, body {
-                background-color: #000000 !important;
-                background-image: none !important;
+            css="""
+            /* Google Fonts (fast swap) */
+            @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap');
+            @import url('https://fonts.googleapis.com/css2?family=Google+Sans+Code:wght@400&display=swap');
+
+            /* Base */
+            html, body { background:#000 !important; height:100%; }
+            .gradio-container { background:#000 !important; color:#fff !important; min-height:100%;
+            font-family:'Roboto', ui-sans-serif, system-ui, sans-serif !important; }
+
+            /* Fixed sidebars */
+            :root { --gia-sidebar-w: clamp(240px, 15vw, 300px); --gia-gap: 10px; }
+            #left-sidebar  { position:fixed !important; top:12px; bottom:12px; left: 8px;
+                            width:var(--gia-sidebar-w); overflow-y:auto; z-index:5; }
+            #right-sidebar { position:fixed !important; top:12px; bottom:12px; right:8px;
+                            width:var(--gia-sidebar-w); overflow-y:auto; z-index:5; }
+
+            /* Ensure left menus never line up side-by-side */
+            #left-stack { display:flex !important; flex-direction:column !important; gap:16px !important; width:100% !important; }
+            #left-stack > * { width:100% !important; }
+
+            /* Slightly smaller menus than chat body */
+            #left-sidebar, #right-sidebar { font-size:0.95rem !important; }
+
+            /* Center column uses ALL remaining width (no clamps) */
+            #center-col {
+            margin-left:  calc(var(--gia-sidebar-w) + var(--gia-gap)) !important;
+            margin-right: calc(var(--gia-sidebar-w) + var(--gia-gap)) !important;
+            max-width:none !important;
+            }
+            #center-col .gr-block, #center-col .gr-form, #center-col .gr-panel, #center-col .gr-row, #center-col > * {
+            max-width:none !important; width:100% !important;
             }
 
-            /* === OVERRIDE GLOBAL CONTAINER === */
-            .gradio-container {
-                background-color: #000000 !important;
-                color: #ffffff !important;
+            /* Chatbot base + dark */
+            [data-testid="chatbot"] { background:#0b0b0b !important; }
+            [data-testid="chatbot"], [data-testid="chatbot"] * { color:#fff !important; }
+            .message.bot, .bubble.bot   { background:#121212 !important; border:none !important; }
+            .message.user, .bubble.user { background:#141414 !important; border:none !important; }
+
+            /* Chat body text (≈18px) */
+            #center-col [data-testid="chatbot"] .prose {
+            font-size:1.125rem !important; line-height:1.75 !important;
+            max-width:none !important; font-family:'Roboto', ui-sans-serif, system-ui, sans-serif !important;
             }
 
-            /* === OVERRIDE CHATBOT CONTAINER + INNER LAYERS === */
-            [data-testid="chatbot"] {
-                background-color: #0b0b0b !important;
-            }
-            [data-testid="chatbot"] > div,
-            [data-testid="chatbot"] .overflow-y-auto,
-            [data-testid="chatbot"] .bg-slate-900,
-            [data-testid="chatbot"] .bg-slate-950,
-            [data-testid="chatbot"] .bg-gray-900,
-            [data-testid="chatbot"] .bg-gray-950,
-            [data-testid="chatbot"] *:where(.bg-slate-900, .bg-slate-950, .bg-gray-900, .bg-gray-950) {
-                background-color: #0b0b0b !important;
+            /* Code font: Google Sans Code Regular 400 at 16px */
+            #center-col [data-testid="chatbot"] .prose pre,
+            #center-col [data-testid="chatbot"] .prose code,
+            #center-col [data-testid="chatbot"] pre code {
+            background:#0f0f0f !important; color:#fff !important;
+            font-family:'Google Sans Code','Consolas',ui-monospace,monospace !important;
+            font-weight:400 !important; font-size:16px !important; line-height:1.6 !important;
             }
 
-            /* === ENSURE TEXT IS WHITE === */
-            [data-testid="chatbot"], [data-testid="chatbot"] * {
-                color: #ffffff !important;
+            /* CRITICAL: remove all max-width clamps inside Chatbot (Gradio/Tailwind wrappers) */
+            #center-col [data-testid="chatbot"] .message,
+            #center-col [data-testid="chatbot"] .bubble { width:100% !important; max-width:100% !important; }
+
+            /* Markdown container & its first child (gr.Markdown wrapper) */
+            #center-col [data-testid="chatbot"] .gr-markdown, 
+            #center-col [data-testid="chatbot"] .gr-markdown > * {
+            max-width:none !important; width:100% !important;
             }
 
-            /* === BUBBLES === */
-            .message.bot, .bubble.bot {
-                background-color: #121212 !important;
-                border: 1px solid #1f1f1f !important;
-            }
-            .message.user, .bubble.user {
-                background-color: #141414 !important;
-                border: 1px solid #222222 !important;
-            }
-
-            /* === CODE BLOCKS === */
-            .prose pre, .prose code {
-                background: #0f0f0f !important;
-                color: #ffffff !important;
-            }
-
-            /* === TEXT INPUTS === */
-            textarea, input, select {
-                background: #121212 !important;
-                color: #ffffff !important;
-                border-color: #222222 !important;
+            /* Tailwind common utility clamps used by Gradio around chat */
+            #center-col [data-testid="chatbot"] .max-w-prose,
+            #center-col [data-testid="chatbot"] .md\\:max-w-prose,
+            #center-col [data-testid="chatbot"] .max-w-2xl,
+            #center-col [data-testid="chatbot"] .md\\:max-w-2xl,
+            #center-col [data-testid="chatbot"] .max-w-3xl,
+            #center-col [data-testid="chatbot"] .md\\:max-w-3xl,
+            #center-col [data-testid="chatbot"] .max-w-screen-md,
+            #center-col [data-testid="chatbot"] .max-w-screen-lg,
+            #center-col [data-testid="chatbot"] .max-w-screen-xl,
+            #center-col [data-testid="chatbot"] .md\\:max-w-screen-md,
+            #center-col [data-testid="chatbot"] .md\\:max-w-screen-lg,
+            #center-col [data-testid="chatbot"] .md\\:max-w-screen-xl {
+            max-width:100% !important;
             }
 
-            /* === BUTTONS === */
-            button {
-                background: #141414 !important;
-                color: #ffffff !important;
-                border: 1px solid #222222 !important;
-            }
-            button:hover {
-                background: #1a1a1a !important;
-            }
+            /* Nuke any other max-w-* utilities, and inline style max-width, inside chatbot */
+            #center-col [data-testid="chatbot"] [class*="max-w-"] { max-width:100% !important; }
+            #center-col [data-testid="chatbot"] *[style*="max-width"] { max-width:100% !important; }
 
-            /* === TABS / PANELS / BLOCKS === */
-            .tabs, .tabitem, .panel, .block, .form {
-                background: #0b0b0b !important;
+            /* Inputs/buttons */
+            textarea, input, select { background:#121212 !important; color:#fff !important; border:none !important; }
+            button { background:#141414 !important; color:#fff !important; border:none !important; }
+            button:hover { background:#1a1a1a !important; }
+
+            /* Narrow screens: stack */
+            @media (max-width: 1200px){
+            #left-sidebar,#right-sidebar { position:static !important; width:auto; height:auto; }
+            #center-col { margin-left:0 !important; margin-right:0 !important; }
             }
             """,
         ) as demo:
-            model_name_display = gr.Markdown("Loading model...", elem_id="model-name-display")
             plugins = load_plugins()
 
             session_state = gr.State(
@@ -1105,143 +1660,158 @@ def launch_app(args: argparse.Namespace) -> None:
                 }
             )
 
-            chatbot = gr.Chatbot(
-                type="messages",
-                value=[],
-                height=600,
-                allow_tags=["think", "answer"],
-                render_markdown=True,
-                show_label=False,
-                layout="bubble",
-            )
             with gr.Row():
-                msg = gr.Textbox(
-                    placeholder="Enter your message or command (e.g., .info, .load, .create, .info, .delete, .unload)",
-                    lines=1,
-                    scale=10,
-                    show_label=False,
-                )
-                send_btn = gr.Button("➤", scale=1)
-
-            # MODE SELECTION
-            mode_radio = gr.Radio(
-                choices=["Local", "HuggingFace", "OpenAI", "OpenRouter"],
-                value="Local",
-                label="Model Mode",
-            )
-            warning_md = gr.Markdown("", visible=False)
-
-            # LOCAL UI
-            with gr.Row(visible=True) as local_row:
-                models_dir_input = gr.Textbox(label="Models Directory", value=CONFIG["MODEL_PATH"])
-                folder_dropdown = gr.Dropdown(choices=[], label="Select a Model")
-                scan_dir_button = gr.Button("Scan Directory")
-
-            # HF UI
-            with gr.Row(visible=False) as hf_row:
-                hf_model_dropdown = gr.Dropdown(
-                    choices=[
-                        "deepseek-ai/DeepSeek-R1",
-                        "Qwen/Qwen3-235B-A22B-Instruct-2507",
-                        "meta-llama/Llama-2-7b-chat-hf",
-                        "mistralai/Mistral-7B-Instruct-v0.1",
-                        "google/gemma-7b-it",
-                        "Qwen/Qwen3-8B",
-                    ],
-                    label="HF Model",
-                    value="deepseek-ai/DeepSeek-R1",
-                )
-
-            # OpenAI UI
-            with gr.Row(visible=False) as openai_row:
-                openai_model_dropdown = gr.Dropdown(
-                    choices=fetch_openai_models(),
-                    label="OpenAI Model",
-                    value="gpt-4o",
-                )
-
-            # OpenRouter UI
-            with gr.Row(visible=False) as openrouter_row:
-                openrouter_model_text = gr.Textbox(
-                    label="OpenRouter Model",
-                    value="x-ai/grok-3-mini",
-                    placeholder="Enter OpenRouter model name (e.g., x-ai/grok-3-mini)",
-                )
-
-            # Confirm model + Load DB
-            confirm_model_button = gr.Button("Confirm Model")
-            with gr.Row():
-                load_button = gr.Button("Load Database")
-
-            # ------------------------ PLUGINS UI (TOP-LEVEL) ------------------------
-            with gr.Accordion("Plugins", open=True):
-                if not plugins:
-                    gr.Markdown("No plugins loaded.")
-                else:
-                    # define the handler once
-                    def plugin_handler_simple(
-                        name: str,
-                        chat_history: List[Dict[str, str]],
-                        state: Dict[str, Any],
-                    ) -> Generator[Tuple[Any, Dict[str, Any]], None, None]:
-                        """
-                        Run a plugin by delegating to the unified backend via '.<plugin>' command,
-                        streaming results while progressively updating the chatbot & state.
-                        """
-                        import gradio as gr
-
-                        try:
-                            # unwrap state if it's a gr.State
-                            if hasattr(state, "value"):
-                                state_dict = state.value or {}
-                            elif isinstance(state, dict):
-                                state_dict = state
-                            else:
-                                state_dict = {}
-
-                            hist = chat_history if isinstance(chat_history, list) else []
-                            cmd = f".{name}"
-
-                            # make it visible that the user triggered the plugin
-                            append_to_chatbot(hist, cmd, metadata={"role": "user"})
-                            yield gr.update(value=list(hist)), state_dict
-
-                            first = True
-                            for item in process_input(cmd, state_dict, hist):
-                                if isinstance(item, list):
-                                    hist[:] = item
-                                else:
-                                    chunk = str(item)
-                                    if not chunk:
-                                        yield gr.update(value=list(hist)), state_dict
-                                        continue
-                                    if first:
-                                        append_to_chatbot(hist, chunk, metadata={"role": "assistant"})
-                                        first = False
-                                    else:
-                                        if hist and hist[-1].get("role") == "assistant":
-                                            hist[-1]["content"] += chunk
-                                        else:
-                                            append_to_chatbot(hist, chunk, metadata={"role": "assistant"})
-
-                                yield gr.update(value=list(hist)), state_dict
-
-                            yield gr.update(value=list(hist)), state_dict
-
-                        except Exception as e:
-                            logger.error(f"[PLUGIN BTN] {name} error: {e}")
-                            append_to_chatbot(chat_history, f"Plugin '{name}' error: {e}", metadata={"role": "assistant"})
-                            yield gr.update(value=list(chat_history)), (state.value if hasattr(state, "value") else state or {})
-
-                    with gr.Row():
-                        for plugin_name in plugins.keys():
-                            btn = gr.Button(value=plugin_name.capitalize())
-                            btn.click(
-                                fn=partial(plugin_handler_simple, plugin_name),
-                                inputs=[chatbot, session_state],
-                                outputs=[chatbot, session_state],
-                                queue=True,
+                # ---------------------- LEFT SIDEBAR (fixed) ----------------------
+                with gr.Column(scale=2, elem_id="left-sidebar"):
+                    with gr.Column(elem_id="left-stack"):
+                        with gr.Accordion("Mode & Models", open=True):
+                            mode_radio = gr.Radio(
+                                choices=["Local", "HuggingFace", "OpenAI", "OpenRouter"],
+                                value="Local",
+                                label="Model Mode",
                             )
+                            warning_md = gr.Markdown("", visible=False)
+
+                            # Local: Models Directory → Scan Directory → Select a Model → Confirm
+                            with gr.Row(visible=True) as local_row:
+                                with gr.Column(scale=6):
+                                    models_dir_input = gr.Textbox(
+                                        label="Models Directory", value=CONFIG["MODEL_PATH"]
+                                    )
+                                    scan_dir_button = gr.Button("Scan Directory")
+                                    folder_dropdown = gr.Dropdown(choices=[], label="Select a Model")
+                                    confirm_local_button = gr.Button("Confirm")
+
+                            # HF UI
+                            with gr.Row(visible=False) as hf_row:
+                                with gr.Column(scale=5):
+                                    hf_model_dropdown = gr.Dropdown(
+                                        choices=[
+                                            "deepseek-ai/DeepSeek-R1",
+                                            "Qwen/Qwen3-235B-A22B-Instruct-2507",
+                                            "meta-llama/Llama-2-7b-chat-hf",
+                                            "mistralai/Mistral-7B-Instruct-v0.1",
+                                            "google/gemma-7b-it",
+                                            "Qwen/Qwen3-8B",
+                                        ],
+                                        label="HF Model",
+                                        value="deepseek-ai/DeepSeek-R1",
+                                    )
+                                with gr.Column(scale=1):
+                                    confirm_hf_button = gr.Button("Confirm")
+
+                            # OpenAI UI
+                            with gr.Row(visible=False) as openai_row:
+                                with gr.Column(scale=5):
+                                    openai_model_dropdown = gr.Dropdown(
+                                        choices=fetch_openai_models(),
+                                        label="OpenAI Model",
+                                        value="gpt-4o",
+                                    )
+                                with gr.Column(scale=1):
+                                    confirm_openai_button = gr.Button("Confirm")
+
+                            # OpenRouter UI
+                            with gr.Row(visible=False) as openrouter_row:
+                                with gr.Column(scale=5):
+                                    openrouter_model_text = gr.Textbox(
+                                        label="OpenRouter Model",
+                                        value="x-ai/grok-3-mini",
+                                        placeholder="Enter OpenRouter model name (e.g., x-ai/grok-3-mini)",
+                                    )
+                                with gr.Column(scale=1):
+                                    confirm_openrouter_button = gr.Button("Confirm")
+
+                        # Database: Databases → Load → Unload → Refresh → New Database → Create Database
+                        with gr.Accordion("Database", open=False):
+                            db_dropdown = gr.Dropdown(choices=[], value=None, label="Databases")
+                            db_load_btn = gr.Button("Load Database")
+                            db_unload_btn = gr.Button("Unload Database")
+                            db_refresh_btn = gr.Button("Refresh")
+                            db_new_name = gr.Textbox(
+                                label="New Database (subfolder of DB_PATH)", placeholder="my-project"
+                            )
+                            db_create_btn = gr.Button("Create Database")
+
+                # ---------------------- CENTER (CHAT, dynamic) ----------------------
+                with gr.Column(scale=8, elem_id="center-col"):
+                    chatbot = gr.Chatbot(
+                        type="messages",
+                        value=[],
+                        height=None,
+                        allow_tags=["think", "answer"],
+                        render_markdown=True,
+                        show_label=False,
+                        layout="bubble",
+                    )
+                    with gr.Row():
+                        msg = gr.Textbox(
+                            placeholder="Enter your message or command (e.g., .info, .load, .create, .delete, .unload)",
+                            lines=1,
+                            scale=10,
+                            show_label=False,
+                        )
+                        send_btn = gr.Button("➤", scale=1)
+
+                # ---------------------- RIGHT SIDEBAR (fixed) ----------------------
+                with gr.Column(scale=2, elem_id="right-sidebar"):
+                    with gr.Accordion("Plugins", open=True):
+                        if not plugins:
+                            gr.Markdown("No plugins loaded.")
+                        else:
+                            def plugin_handler_simple(
+                                name: str,
+                                chat_history: List[Dict[str, str]],
+                                state: Dict[str, Any],
+                            ) -> Generator[Tuple[Any, Dict[str, Any]], None, None]:
+                                """Run a plugin by delegating to '.<plugin>' command, streaming results."""
+                                import gradio as gr
+                                try:
+                                    state_dict = state.value if hasattr(state, "value") else (state if isinstance(state, dict) else {})
+                                    hist = chat_history if isinstance(chat_history, list) else []
+                                    cmd = f".{name}"
+                                    append_to_chatbot(hist, cmd, metadata={"role": "user"})
+                                    yield gr.update(value=list(hist)), state_dict
+
+                                    first = True
+                                    for item in process_input(cmd, state_dict, hist):
+                                        if isinstance(item, list):
+                                            hist[:] = item
+                                        else:
+                                            chunk = str(item)
+                                            if not chunk:
+                                                yield gr.update(value=list(hist)), state_dict
+                                                continue
+                                            if first:
+                                                append_to_chatbot(hist, chunk, metadata={"role": "assistant"})
+                                                first = False
+                                            else:
+                                                if hist and hist[-1].get("role") == "assistant":
+                                                    hist[-1]["content"] += chunk
+                                                else:
+                                                    append_to_chatbot(hist, chunk, metadata={"role": "assistant"})
+                                        yield gr.update(value=list(hist)), state_dict
+                                    yield gr.update(value=list(hist)), state_dict
+                                except Exception as e:
+                                    logger.error(f"[PLUGIN BTN] {name} error: {e}")
+                                    append_to_chatbot(chat_history, f"Plugin '{name}' error: {e}", metadata={"role": "assistant"})
+                                    yield gr.update(value=list(chat_history)), (state.value if hasattr(state, "value") else state or {})
+                            with gr.Row():
+                                for plugin_name in plugins.keys():
+                                    btn = gr.Button(value=plugin_name.capitalize())
+                                    btn.click(
+                                        fn=partial(plugin_handler_simple, plugin_name),
+                                        inputs=[chatbot, session_state],
+                                        outputs=[chatbot, session_state],
+                                        queue=True,
+                                    )
+
+                    with gr.Accordion("Status", open=True):
+                        model_name_display = gr.Markdown(
+                            "Status will appear here.", elem_id="model-name-display"
+                        )
+
+            # ===== Wiring =====
 
             def update_mode_visibility(selected_mode: str, state):
                 if hasattr(state, "value"):
@@ -1265,7 +1835,11 @@ def launch_app(args: argparse.Namespace) -> None:
                         if not api.token:
                             logger.warning("HF_TOKEN not set; fetching public models only - may limit results.")
                         deployed = api.list_models(
-                            inference="warm", pipeline_tag="text-generation", limit=100, sort="downloads", direction=-1
+                            inference="warm",
+                            pipeline_tag="text-generation",
+                            limit=100,
+                            sort="downloads",
+                            direction=-1,
                         )
                         models = [m.id for m in deployed if m.id]
                         models = sorted(set(models))
@@ -1276,8 +1850,8 @@ def launch_app(args: argparse.Namespace) -> None:
                         models = [
                             "deepseek-ai/DeepSeek-R1",
                             "deepseek-ai/DeepSeek-V3",
-                            "mistralai/Mistral-7B-Instruct-v0.2",
-                            "meta-llama/Meta-Llama-3-8B-Instruct",
+                            "Mistral-7B-Instruct-v0.2",
+                            "Meta-Llama-3-8B-Instruct",
                             "Qwen/Qwen3-14B",
                         ]
                         hf_update = gr.update(choices=models, value="deepseek-ai/DeepSeek-R1")
@@ -1310,25 +1884,18 @@ def launch_app(args: argparse.Namespace) -> None:
                 inputs=[mode_radio, session_state],
                 outputs=[local_row, hf_row, openai_row, openrouter_row, warning_md, session_state, hf_model_dropdown],
             )
-
             hf_model_dropdown.change(
-                lambda model, state: (state.value.update({"hf_model_name": model}) or state)
-                if hasattr(state, "value")
-                else (state.update({"hf_model_name": model}) or state),
+                lambda model, state: ((state.value.update({"hf_model_name": model}) or state) if hasattr(state, "value") else (state.update({"hf_model_name": model}) or state)),
                 inputs=[hf_model_dropdown, session_state],
                 outputs=[session_state],
             )
             openai_model_dropdown.change(
-                lambda model, state: (state.value.update({"openai_model_name": model}) or state)
-                if hasattr(state, "value")
-                else (state.update({"openai_model_name": model}) or state),
+                lambda model, state: ((state.value.update({"openai_model_name": model}) or state) if hasattr(state, "value") else (state.update({"openai_model_name": model}) or state)),
                 inputs=[openai_model_dropdown, session_state],
                 outputs=[session_state],
             )
             openrouter_model_text.change(
-                lambda model, state: (state.value.update({"openrouter_model_name": model}) or state)
-                if hasattr(state, "value")
-                else (state.update({"openrouter_model_name": model}) or state),
+                lambda model, state: ((state.value.update({"openrouter_model_name": model}) or state) if hasattr(state, "value") else (state.update({"openrouter_model_name": model}) or state)),
                 inputs=[openrouter_model_text, session_state],
                 outputs=[session_state],
             )
@@ -1339,7 +1906,6 @@ def launch_app(args: argparse.Namespace) -> None:
                 outputs=[folder_dropdown, chatbot],
             )
 
-            # Confirm model
             def confirm_model_handler(
                 selected_folder: str,
                 state: gr.State,
@@ -1350,15 +1916,12 @@ def launch_app(args: argparse.Namespace) -> None:
                 chat_history: List[Dict[str, str]],
             ) -> Tuple[List[Dict[str, str]], Dict, str]:
                 """Handle model confirmation button in Gradio, updating state and loading model."""
-                if hasattr(state, "value"):
-                    state_dict = state.value
-                else:
-                    state_dict = state if isinstance(state, dict) else {}
+                state_dict = state.value if hasattr(state, "value") else (state if isinstance(state, dict) else {})
                 logger.debug(f"Confirming model for mode: {mode}, state: {state_dict}")
-                state_dict["model_path_gr"] = selected_folder if mode == "Local" else None
-                state_dict["hf_model_name"] = hf_model if mode == "HuggingFace" else state_dict.get("hf_model_name", "deepseek-ai/DeepSeek-R1")
-                state_dict["openai_model_name"] = openai_model if mode == "OpenAI" else state_dict.get("openai_model_name", "gpt-3.5-turbo")
-                state_dict["openrouter_model_name"] = openrouter_model if mode == "OpenRouter" else state_dict.get("openrouter_model_name", "x-ai/grok-3-mini")
+                state_dict["model_path_gr"] = (selected_folder if mode == "Local" else None)
+                state_dict["hf_model_name"] = (hf_model if mode == "HuggingFace" else state_dict.get("hf_model_name", "deepseek-ai/DeepSeek-R1"))
+                state_dict["openai_model_name"] = (openai_model if mode == "OpenAI" else state_dict.get("openai_model_name", "gpt-3.5-turbo"))
+                state_dict["openrouter_model_name"] = (openrouter_model if mode == "OpenRouter" else state_dict.get("openrouter_model_name", "x-ai/grok-3-mini"))
                 try:
                     status, updated_state = finalize_model_selection(mode, state_dict)
                     logger.info(f"Model confirmation successful for mode {mode}")
@@ -1372,18 +1935,49 @@ def launch_app(args: argparse.Namespace) -> None:
                     updated_chatbot = append_to_chatbot(chat_history, error_msg, metadata={"role": "assistant"})
                     return updated_chatbot, state_dict, error_msg
 
-            confirm_model_button.click(
+            confirm_local_button.click(
+                fn=confirm_model_handler,
+                inputs=[folder_dropdown, session_state, mode_radio, hf_model_dropdown, openai_model_dropdown, openrouter_model_text, chatbot],
+                outputs=[chatbot, session_state, model_name_display],
+            )
+            confirm_hf_button.click(
+                fn=confirm_model_handler,
+                inputs=[folder_dropdown, session_state, mode_radio, hf_model_dropdown, openai_model_dropdown, openrouter_model_text, chatbot],
+                outputs=[chatbot, session_state, model_name_display],
+            )
+            confirm_openai_button.click(
+                fn=confirm_model_handler,
+                inputs=[folder_dropdown, session_state, mode_radio, hf_model_dropdown, openai_model_dropdown, openrouter_model_text, chatbot],
+                outputs=[chatbot, session_state, model_name_display],
+            )
+            confirm_openrouter_button.click(
                 fn=confirm_model_handler,
                 inputs=[folder_dropdown, session_state, mode_radio, hf_model_dropdown, openai_model_dropdown, openrouter_model_text, chatbot],
                 outputs=[chatbot, session_state, model_name_display],
             )
 
-            # Load DB
-            load_button.click(
-                fn=handle_load_button,
-                inputs=[session_state],
-                outputs=[chatbot, session_state],
+            db_load_btn.click(
+                fn=db_load_handler,
+                inputs=[db_dropdown, session_state, chatbot],
+                outputs=[chatbot, session_state, model_name_display],
             )
+            db_unload_btn.click(
+                fn=db_unload_handler,
+                inputs=[session_state, chatbot],
+                outputs=[chatbot, session_state, model_name_display],
+            )
+            db_refresh_btn.click(
+                fn=ui_refresh_db_list,
+                inputs=[],
+                outputs=[db_dropdown, model_name_display],
+            )
+            db_create_btn.click(
+                fn=ui_create_db,
+                inputs=[db_new_name],
+                outputs=[db_dropdown, model_name_display, db_new_name],
+            )
+            demo.load(fn=ui_refresh_db_list, inputs=[], outputs=[db_dropdown, model_name_display])
+
             send_btn.click(
                 fn=chat_fn,
                 inputs=[msg, chatbot, session_state],
@@ -1397,7 +1991,6 @@ def launch_app(args: argparse.Namespace) -> None:
                 queue=True,
             )
 
-        # INIT GRADIO SERVER LAUNCH
         demo.queue()
         demo.launch(
             server_name="0.0.0.0",
@@ -1407,101 +2000,60 @@ def launch_app(args: argparse.Namespace) -> None:
             inbrowser=True,
             quiet=True,
         )
-        # SIGNAL LAUNCH COMPLETE
         launch_event.set()
 
     try:
         if not args.cli:
-            # START DAEMON THREAD FOR GRADIO
             launch_thread = threading.Thread(target=threaded_launch, daemon=True)
             launch_thread.start()
             time.sleep(1)
             logger.info("Gradio app launched in background thread. Main terminal freed for CLI.")
-        # RUN CLI LOOP IN MAIN THREAD
         cli_loop()
     except Exception as e:
         logger.error(f"Failed to launch Gradio in thread or start CLI: {str(e)}")
         raise
 
-def tag() -> str:
-    """Generate timestamped prefix for logger, including current mode for context.
 
-    Note: Relies on shared memory for state updates across threads (e.g., Gradio/CLI).
-    """
-    # TO LOAD APPLICATION STATE - ENSURES CURRENT CONFIGURATION IS USED; THREAD-SAFE READ.
+def tag() -> str:
+    """Return a timestamped prefix including current mode, based on shared state."""
     app_state: ProjectState = load_state()
-    # TO DETECT PRESENCE FOR MODE - LOCAL IF MODEL SET (VIA LOAD_LLM FOR LOCAL), ELSE ONLINE.
-    model = getattr(app_state, "MODEL", None)
-    mode_str = "local" if model is not None else "online"
-    # TO FORMAT TIMESTAMP - ENSURES CONSISTENT LOG PREFIX.
+    llm = getattr(app_state, "LLM", None)
+    mode = (getattr(app_state, "MODE", None) or "").strip().lower()
+    if llm is None:
+        mode_str = "idle"
+    elif mode == "local":
+        mode_str = "local"
+    else:
+        mode_str = "online"
     current_time = datetime.now().strftime("[%H:%M:%S]")
-    # TO BUILD PREFIX - COMBINES TIME AND MODE FOR TRACEABILITY.
     return f"{current_time} GIA@{mode_str}: "
+
 
 def cli_prompt() -> str:
     """
-    Generate a colored Linux-like terminal prompt string.
+    Generate a colored terminal prompt 'GIA@<mode>:~$' without including the path.
 
-    Format: 'GIA@<mode>:<current_path>$ ' with color styling.
-    Mode resolution:
-      - 'idle'   -> no model loaded (LLM is None)
-      - 'local'  -> MODE == 'Local' and LLM is set
-      - 'online' -> otherwise (e.g., OpenAI/HF/OpenRouter providers)
+    - Mode: idle (no LLM) | local (MODE == Local) | online (remote providers)
+    - Robust to state access failures; never raises.
     """
-    from colorama import Fore
-    import os, sys
-
-    # --- safe access to state without crashing on older StateManager variants ---
     try:
-        from gia.core.state import state_manager, load_state
+        snap = load_state()
+        llm = getattr(snap, "LLM", None)
+        mode = (getattr(snap, "MODE", None) or "").strip().lower()
     except Exception:
-        state_manager, load_state = None, None
+        llm, mode = None, ""
 
-    def _safe_sm_get(key: str, default=None):
-        try:
-            if state_manager and hasattr(state_manager, "get_state"):
-                return state_manager.get_state(key, default)
-            if state_manager and hasattr(state_manager, "_state"):
-                return getattr(state_manager, "_state", {}).get(key, default)
-        except Exception:
-            pass
-        return default
-
-    llm = None
-    mode = None
-
-    # prefer structured snapshot when available
-    try:
-        if load_state:
-            snap = load_state()
-            llm = getattr(snap, "LLM", None)
-            mode = getattr(snap, "MODE", None)
-    except Exception:
-        # fall back to reading the live store
-        llm = _safe_sm_get("LLM", None)
-        mode = _safe_sm_get("MODE", None)
-
-    mode_norm = (mode or "").strip().lower()
     if llm is None:
         mode_str = "idle"
-    elif mode_norm == "local":
+    elif mode == "local":
         mode_str = "local"
     else:
         mode_str = "online"
 
-    # cwd → '~' abbreviation
-    cwd = os.getcwd()
-    home = os.environ.get("HOME", "")
-    if not home:
-        raise ValueError("HOME environment variable not set; required for path abbreviation.")
-    path_str = "~" + cwd[len(home):] if cwd.startswith(home) else cwd
-    if not path_str:
-        raise ValueError("Current working directory could not be determined.")
-
     user = "GIA"
     host = mode_str
-    prompt = f"{Fore.GREEN}{user}@{host}{Fore.RESET}:~$ "
-    return prompt
+    return f"{Fore.GREEN}{user}@{host}{Fore.RESET}:~$ "
+
 
 def cli_loop() -> None:
     """
@@ -1614,6 +2166,7 @@ def cli_loop() -> None:
 
         console.print("")
 
+
 def load_database_wrapper(state: Dict[str, Any]) -> str:
     """Load DB + query engine using the current LLM; keep UI flags in sync."""
     app_state = load_state()
@@ -1632,6 +2185,7 @@ def load_database_wrapper(state: Dict[str, Any]) -> str:
         logger.error("load_database_wrapper failed: %s", e)
         return f"Error loading database: {e}"
 
+
 def signal_handler(sig, frame) -> None:
     """Handle termination signals."""
     # TO LOG SIGNAL
@@ -1639,6 +2193,7 @@ def signal_handler(sig, frame) -> None:
         f"{Style.DIM + Fore.LIGHTBLACK_EX}{tag()}Signal received: {sig}. Exiting gracefully.{Style.RESET_ALL}"
     )
     sys.exit(0)
+
 
 def cleanup() -> None:
     """Clean up resources on exit."""
@@ -1657,13 +2212,16 @@ def cleanup() -> None:
             f"{Style.DIM + Fore.LIGHTBLACK_EX}{tag()}No CUDA detected. Cleanup complete.{Style.RESET_ALL}"
         )
 
+
 if __name__ == "__main__":
     import signal
     import argparse
 
     # PARSE COMMAND LINE ARGUMENTS
     parser = argparse.ArgumentParser(description="GIA: General Intelligence Assistant")
-    parser.add_argument("--cli", action="store_true", help="Run in CLI-only mode without Gradio")
+    parser.add_argument(
+        "--cli", action="store_true", help="Run in CLI-only mode without Gradio"
+    )
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, signal_handler)

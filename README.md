@@ -14,6 +14,8 @@ GIA is a Python-based tool that combines large language models (LLMs), Retrieval
 - **Synced Interfaces**: Use CLI or web UI interchangeably—sessions stay in sync.
 - **Resource Management**: Optimized for long-running operations without excessive resource consumption.
 
+![UI Screenshot](https://sicorps.com/content/484336479-b3d84b5a-309d-4039-9696-294ba61e2a9f.png)
+
 ## Quick Start
 
 Follow these steps to install and run GIA.

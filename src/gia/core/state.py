@@ -8,14 +8,16 @@ that state values can be accessed and modified safely across different modules.
 from dataclasses import dataclass, fields
 from typing import Any, Optional, List
 import threading
-from gia.config import CONFIG, PROJECT_ROOT
-from gia.core.logger import logger, log_banner
+from gia.config import CONFIG
+from gia.core.logger import log_banner
 
 log_banner(__file__)
+
 
 @dataclass
 class ProjectState:
     """Dataclass for dot access to state values with fallbacks."""
+
     CHROMA_COLLECTION: Any = None
     EMBED_MODEL: Any = None
     LLM: Any = None
@@ -34,8 +36,10 @@ class ProjectState:
     MODE: str | None = None  # EXPLICIT MODE: "Local" OR "Online"; NONE INITIAL
     COLLECTION_NAME: str | None = None
 
+
 class StateManager:
     """Manage project-wide state safely across modules (singleton)."""
+
     _instance = None
 
     def __new__(cls):
@@ -50,7 +54,9 @@ class StateManager:
 
         # Validate collection name coming from CONFIG (which already reads config.toml)
         collection_name = CONFIG.get("COLLECTION_NAME")
-        if not isinstance(collection_name, str) or not (3 <= len(collection_name) <= 63):
+        if not isinstance(collection_name, str) or not (
+            3 <= len(collection_name) <= 63
+        ):
             collection_name = "GIA_db"
 
         self._state = {
@@ -85,12 +91,13 @@ class StateManager:
         with self._lock:
             return self._state.get(key, default)
 
+
 state_manager = StateManager()
+
 
 def load_state() -> ProjectState:
     """Snapshot current state into a dataclass (dot-access)."""
     state_dict = {
-        f.name: state_manager.get_state(f.name, f.default)
-        for f in fields(ProjectState)
+        f.name: state_manager.get_state(f.name, f.default) for f in fields(ProjectState)
     }
     return ProjectState(**state_dict)

@@ -41,8 +41,12 @@ def main() -> None:
     os.environ["PYTHONUNBUFFERED"] = "1"
 
     parser = argparse.ArgumentParser(description="Launch the GIA application")
-    parser.add_argument("--cli", action="store_true", help="Run in CLI-only mode without Gradio UI")
-    parser.add_argument("--debug", action="store_true", help="Override DEBUG mode to True")
+    parser.add_argument(
+        "--cli", action="store_true", help="Run in CLI-only mode without Gradio UI"
+    )
+    parser.add_argument(
+        "--debug", action="store_true", help="Override DEBUG mode to True"
+    )
     args, unknown = parser.parse_known_args()
     if unknown:
         print(f"Warning: Ignoring unknown arguments: {unknown}")

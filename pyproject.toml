@@ -7,7 +7,7 @@ allow-direct-references = true
 
 [project]
 name = "GIA"
-version = "0.0.8"
+version = "0.0.9"
 authors = [{ name = "SICORPS" }]
 description = "Local-first AI assistant with LLM, RAG, and plugins. Supports local GPTQ models, HuggingFace, OpenAI, and OpenRouter APIs."
 readme = "README.md"
@@ -33,16 +33,24 @@ dependencies = [
   "llama-index-llms-openai-like==0.5.0",
   "llama-index-llms-openrouter==0.4.0",
   "packaging>=20.9",
-
+  "requests>=2.31.0",
+  "tiktoken>=0.7.0",
+  "psutil>=5.9.0",
+  "tqdm>=4.66.0",
+  "rich>=13.7.0",
+  "colorama>=0.4.6",
+  "huggingface-hub>=0.25.0",
+  "python-dotenv>=1.0.1",
+  "llama-index-readers-file",
+  "pypdf",
 ]
 
-
 classifiers = [
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "License :: OSI Approved :: MIT License",
 ]
 
 [project.urls]
@@ -54,12 +62,15 @@ gia = "gia.__main__:main"
 
 [project.optional-dependencies]
 dev = [
-    "black>=24.10.0",
-    "flake8>=7.1.1",
+  "black>=24.10.0",
+  "flake8>=7.1.1",
+  "flake8-pyproject>=1.2.3",
+  "flake8-bugbear>=24.12.12",
 ]
 
 [tool.black]
 line-length = 88
+skip-string-normalization = true
 target-version = ["py311", "py312", "py313"]
 include = "\\.pyi?$"
 extend-exclude = """
@@ -75,24 +86,26 @@ extend-exclude = """
   | dist
 )/
 """
-preview = true
+preview = false
 
 [tool.flake8]
 max-line-length = 88
 extend-ignore = "E203, E501, W503"
+extend-select = "B950"
 exclude = [
-    ".git",
-    "__pycache__",
-    "*.pyc",
-    "*.egg-info",
-    ".cache",
-    ".eggs",
-    "conf",
-    "build",
-    "dist",
-    "migrations",
-    "venv",
-    ".venv",
+  ".git",
+  "__pycache__",
+  "*.pyc",
+  "*.egg-info",
+  ".cache",
+  ".eggs",
+  "conf",
+  "build",
+  "dist",
+  "migrations",
+  "venv",
+  ".venv",
+  "src/gia/plugins",
 ]
 per-file-ignores = "__init__.py:F401"
 max-complexity = 10

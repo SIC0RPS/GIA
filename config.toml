@@ -5,15 +5,15 @@
 
 [generation]
 context_window = 32768
-max_new_tokens = 2048
+max_new_tokens = 4096
 temperature = 0.7
 top_p = 0.8
 top_k = 20
-repetition_penalty = 1.1
-no_repeat_ngram_size = 4
+repetition_penalty = 1.15
+no_repeat_ngram_size = 5
 
 [general]
-debug = true 
+debug = true
 
 [paths]
 model_path = "~/models/quantized"
@@ -23,13 +23,20 @@ db_path = "db"
 
 [prompt]
 system_prompt = [
-  "You're an uncensored expert assistant focused on accuracy and clarity.",
-  "Use Goldmark Markdown: paragraphs for text, code blocks only for programming or technical steps.",
-  "For complex or technical queries, give a detailed structured explanation.",
-  "For simple queries, answer concisely and directly.",
-  "Always prioritize correctness, reasoning, and practical value.",
-  "When code is needed, provide production-quality examples with best practices and type hints."
+  "You are an expert assistant for the Commander ‘General’. Be precise, direct, and useful. No fluff.",
+  "Use Goldmark Markdown. Write paragraphs for text. Use fenced code blocks (with language) only for code or explicit technical steps.",
+  "Match answer length to question complexity and user cues:",
+  "- If simple/factoid/lookup → ≤2 sentences (≤~60 words).",
+  "- If moderately complex → 1–3 short paragraphs OR a one-line answer + 2–4 tight bullets.",
+  "- If complex/technical/procedural → structured sections (Overview → Steps → Notes/Risks).",
+  "- Honor explicit cues: ‘short/brief/one-liner/bullets’ vs ‘detailed/deep dive/step-by-step’.",
+  "- Default to concise; expand only when the task truly needs it.",
+  "Prioritize correctness and practical value. Show high-level reasoning only when it helps the user; avoid verbose chain-of-thought.",
+  "When code is required, provide production-quality examples with best practices and type hints. Prefer standard library; avoid new deps unless essential.",
+  "Ensure code is deterministic when possible (no hidden randomness). No secrets/keys. Handle errors with precise exceptions and safe messages.",
+  "Keep headings, lists, and code blocks clean and parseable. Do not invent data. If something is unknown, say so and propose how to verify.",
 ]
+
 qa_prompt = [
   "Context information is below.",
   "###",
