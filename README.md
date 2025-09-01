@@ -1,6 +1,12 @@
 # GIA
+> ### Chat with AI in your browser or terminal, using your own models, online models, your own data, and your own plugins.
 
-GIA is a local first extensible AI assistant built for developers and power users. It runs on your own hardware with local models or connects to APIs like OpenAI HuggingFace and OpenRouter with dynamic model selection. You can work with your own data build custom plugins run quantized models via GPTQModel and load `.safetensors` models directly through the Gradio UI no coding required.
+- Web chat UI (Gradio) and terminal interface, always in sync.  
+- Load models stored on your machine, or connect to APIs like OpenAI, Hugging Face, or OpenRouter.  
+- Give it files (PDFs, text) — it uses them for answers.  
+- Add your own tools with simple Python plugins.  
+
+It runs on your own hardware with local models or connects to APIs like OpenAI HuggingFace and OpenRouter with dynamic model selection. You can work with your own data build custom plugins run quantized models via GPTQModel and load `.safetensors` models directly through the Gradio UI no coding required.
 
 ## Features
 
@@ -43,8 +49,6 @@ Follow these steps to install and run GIA.
    ```
 
 3. **Install Dependencies + GIA**
-
-   Choose one method (pip or uv) to install dependencies from requirements.lock and set up GIA in editable mode. If using uv and it's not installed, run `pip install uv` (see [PyPI page](https://pypi.org/project/uv/) for details).
 
    - **Using pip**:
      ```
