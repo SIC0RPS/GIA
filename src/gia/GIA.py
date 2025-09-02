@@ -160,56 +160,6 @@ def ui_create_db(new_name: str) -> Tuple[Any, str, str]:
     update, _ = ui_refresh_db_list()
     return update, f"Collection '{name}' created.", ""
 
-def _resolve_collection_name() -> str:
-    """
-    Resolve the Chroma collection name with this precedence:
-      1) Runtime override from state_manager ('COLLECTION_NAME')
-      2) [database].collection_name in config.toml
-      3) CONFIG["COLLECTION_NAME"]
-      4) hard default "GIA_db"
-    Enforces 3..63 chars.
-    """
-    # 1) Runtime override
-    try:
-        override = state_manager.get_state("COLLECTION_NAME")
-        if isinstance(override, str) and override.strip():
-            name = override.strip()
-            n = len(name)
-            if 3 <= n <= 63:
-                return name
-            logger.warning("(CFG) Override collection_name length %d invalid; ignoring", n)
-    except Exception as e:
-        logger.debug(f"(CFG) Could not read COLLECTION_NAME override: {e}")
-
-    # 2) config.toml
-    cfg_path = PROJECT_ROOT.parent.parent / "config.toml"
-    name_from_toml = None
-    try:
-        if cfg_path.exists():
-            with cfg_path.open("rb") as f:
-                _cfg = tomllib.load(f)
-            name_from_toml = (
-                _cfg.get("database", {}).get("collection_name", None)
-                if isinstance(_cfg, dict)
-                else None
-            )
-    except Exception as e:
-        logger.warning(f"(CFG) Failed reading config.toml for collection_name: {e}")
-
-    # 3) CONFIG then 4) default
-    name = name_from_toml or CONFIG.get("COLLECTION_NAME") or "GIA_db"
-
-    # Validate & sanitize
-    if not isinstance(name, str):
-        logger.warning("(CFG) COLLECTION_NAME not a string; using 'GIA_db'")
-        name = "GIA_db"
-    n = len(name)
-    if n < 3 or n > 63:
-        logger.warning("(CFG) COLLECTION_NAME length %d invalid; using 'GIA_db'", n)
-        name = "GIA_db"
-
-    return name
-
 def ui_load_db(selected_name: str) -> str:
     """
     Select the active Chroma collection name for subsequent DB operations.

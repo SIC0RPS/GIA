@@ -39,6 +39,7 @@ from llama_index.llms.huggingface_api import HuggingFaceInferenceAPI
 from gptqmodel import GPTQModel, QuantizeConfig
 from llama_index.llms.openrouter import OpenRouter
 from llama_index.readers.file import PyPDFReader
+from llama_index.readers.file import PDFReader
 
 from gia.core.logger import logger, log_banner
 from gia.config import CONFIG, system_prefix, PROJECT_ROOT
@@ -321,7 +322,7 @@ def save_database():
                 documents = SimpleDirectoryReader(
                     input_files=batch_paths,
                     encoding="utf-8",
-                    file_extractor={".pdf": PyPDFReader()},
+                    file_extractor={".pdf": PDFReader()},
                 ).load_data()
                 logger.info(f"Loaded {len(documents)} documents in batch")
 
