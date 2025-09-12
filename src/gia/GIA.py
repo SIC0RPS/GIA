@@ -281,20 +281,20 @@ class PluginSandbox:
             args: Positional arguments for the function.
             kwargs: Keyword arguments for the function.
         """
-        # MIL: ASSIGN METADATA AND IPC QUEUES
+        # ASSIGN METADATA AND IPC QUEUES
         self.plugin_name = plugin_name
         self.func = func
         self.args = args
         self.kwargs = kwargs
 
-        # MIL: THREAD HANDLE + IPC
+        # THREAD HANDLE + IPC
         self.thread: Optional[threading.Thread] = None
         self.output_queue: Queue = Queue()  # RESULTS/STREAMING
         self.input_queue: Queue = Queue()  # CONTROL COMMANDS (E.G., "stop")
         self.logger_queue: Queue = Queue()  # LOG RECORDS FROM WORKER
         self.stop_event = threading.Event()  # COOPERATIVE STOP SIGNAL
 
-        # MIL: PER-SANDBOX QueueListener (TERMINAL/STDOUT ONLY)
+        # PER-SANDBOX QueueListener (TERMINAL/STDOUT ONLY)
         self.listener: Optional[QueueListener] = None
 
     def start(self) -> None:
@@ -339,11 +339,11 @@ class PluginSandbox:
         WHY:
             - GRACEFUL SHUTDOWN; PREVENT RESOURCE LEAKS.
         """
-        # MIL: SIGNAL STOP
+        # SIGNAL STOP
         self.stop_event.set()
         self.input_queue.put("stop")
 
-        # MIL: JOIN WITH TIMEOUT FOR RELIABILITY
+        # JOIN WITH TIMEOUT FOR RELIABILITY
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=5.0)
             if self.thread.is_alive():
@@ -356,7 +356,7 @@ class PluginSandbox:
                 except Exception:
                     pass
 
-        # MIL: TEAR DOWN LISTENER
+        # TEAR DOWN LISTENER
         if self.listener:
             try:
                 self.listener.stop()
@@ -383,15 +383,15 @@ class PluginSandbox:
             - DUPLICATE LOGS: HANDLER IS ALWAYS REMOVED IN FINALLY.
             - UI CRASH: EXCEPTIONS ARE SENT VIA QUEUE; THREAD DOES NOT HARD-CRASH.
         """
-        # MIL: OBTAIN ROOT LOGGER VIA MODULE-LEVEL API (FIXES AttributeError)
+        # OBTAIN ROOT LOGGER VIA MODULE-LEVEL API (FIXES AttributeError)
         root_logger = logging.getLogger()
 
-        # MIL: ATTACH A QueueHandler TO ROUTE RECORDS TO THIS SANDBOX'S QUEUE
+        # ATTACH A QueueHandler TO ROUTE RECORDS TO THIS SANDBOX'S QUEUE
         queue_handler: QueueHandler = QueueHandler(logger_queue)
         root_logger.addHandler(queue_handler)
 
         try:
-            # MIL: DIAGNOSTIC — CONFIRM THREAD START
+            # DIAGNOSTIC — CONFIRM THREAD START
             try:
                 logger.debug(
                     "Plugin thread started; executing '%s'.",
@@ -400,11 +400,11 @@ class PluginSandbox:
             except Exception:
                 pass
 
-            # MIL: EXECUTE PLUGIN (GENERATOR OR REGULAR)
+            # EXECUTE PLUGIN (GENERATOR OR REGULAR)
             result = func(*args, **kwargs)
 
             if inspect.isgenerator(result):
-                # MIL: STREAM CHUNKS WITH COOPERATIVE-STOP + COMMAND CHECK
+                # STREAM CHUNKS WITH COOPERATIVE-STOP + COMMAND CHECK
                 for chunk in result:
                     if stop_event.is_set():
                         try:
@@ -422,10 +422,10 @@ class PluginSandbox:
                             break
                     except Empty:
                         pass
-                    # MIL: FORWARD OUTPUT
+                    # FORWARD OUTPUT
                     output_queue.put(chunk)
             else:
-                # MIL: NON-GENERATOR RESULT PATH
+                # NON-GENERATOR RESULT PATH
                 if stop_event.is_set():
                     try:
                         logger.info("Plugin stopped by event")
@@ -434,11 +434,11 @@ class PluginSandbox:
                 else:
                     output_queue.put(result)
 
-            # MIL: SENTINEL — SIGNAL END OF STREAM
+            # SENTINEL — SIGNAL END OF STREAM
             output_queue.put(None)
 
         except Exception as exc:
-            # MIL: SAFE ERROR TUNNEL — NO STACK TRACE LEAK TO UI BY DEFAULT
+            # SAFE ERROR TUNNEL — NO STACK TRACE LEAK TO UI BY DEFAULT
             try:
                 logger.error("Plugin error: %s", exc)
             except Exception:
@@ -447,7 +447,7 @@ class PluginSandbox:
             output_queue.put(None)
 
         finally:
-            # MIL: CRITICAL — ALWAYS REMOVE HANDLER TO PREVENT DUPLICATE LOGS/LEAKS
+            # CRITICAL — ALWAYS REMOVE HANDLER TO PREVENT DUPLICATE LOGS/LEAKS
             try:
                 root_logger.removeHandler(queue_handler)
                 try:
@@ -455,7 +455,7 @@ class PluginSandbox:
                 except Exception:
                     pass
             except Exception:
-                # MIL: NEVER RAISE ON CLEANUP
+                # NEVER RAISE ON CLEANUP
                 pass
 
 
@@ -545,7 +545,6 @@ def m_hash(filepath: str) -> str:
             hash_sha256.update(chunk)
     return hash_sha256.hexdigest()
 
-
 def handle_command(
     cmd: str,
     chat_history: List[Dict[str, str]],
@@ -554,10 +553,18 @@ def handle_command(
 ) -> Union[str, Generator[Union[str, List[Dict[str, str]]], None, None]]:
     """
     Handle ONLY built-in & plugin commands (strings starting with '.').
+
     Returns:
       - str for immediate results (built-ins)
       - generator yielding text chunks or a full history list (plugins)
     No history mutation here; wrappers/process_input handle appends.
+
+    Standard plugin signature (mandatory):
+        def <plugin_name>(
+            state: ProjectState,                           # read-only snapshot of all state vars
+            chat_history: List[Dict[str, str]] | None = None,
+            arg: str | None = None,                        # optional single CLI argument
+        ) -> Generator[..., ...] | Iterable[...] | str
     """
     app_state = load_state()
     state_dict: Dict[str, Any] = state if isinstance(state, dict) else {}
@@ -657,62 +664,27 @@ def handle_command(
     plugin_name = parts[0][1:].lower()
     optional_arg = parts[1] if len(parts) == 2 else None
 
-    # EARLY DEP CHECK FOR GENMASTER TO AVOID STARTING THE PLUGIN WHEN NOT READY
-    if plugin_name == "genmaster":
-        missing: List[str] = []
-        if app_state.LLM is None:
-            missing.append("llm")
-        if app_state.QUERY_ENGINE is None:
-            missing.append("query_engine")
-        if app_state.EMBED_MODEL is None:
-            missing.append("embed_model")
-        if missing:
-            msg = (
-                "Error: Missing dependencies for '.genmaster': "
-                + ", ".join(missing)
-                + ". Load a model and the DB first (.load)."
-            )
-            logger.error("(G.M) %s", msg)
-            return msg
-
     if plugin_name not in plugins:
         return f"Error: Plugin '{plugin_name}' not found."
 
     plugin_func = plugins[plugin_name]
-    available_kwargs = {
-        "llm": app_state.LLM,
-        "query_engine": app_state.QUERY_ENGINE,
-        "embed_model": app_state.EMBED_MODEL,
-        "chat_history": chat_history,
-    }
-    sig = inspect.signature(plugin_func)
+
+    # Strict standardized call: provide a ProjectState snapshot, chat history, and optional arg
     kwargs_to_pass: Dict[str, Any] = {
-        k: v for k, v in available_kwargs.items() if k in sig.parameters
+        "state": app_state,
+        "chat_history": chat_history,
+        "arg": optional_arg,
     }
-    if optional_arg is not None:
-        if "arg" in sig.parameters:
-            kwargs_to_pass["arg"] = optional_arg
-        elif "query" in sig.parameters:
-            kwargs_to_pass["query"] = optional_arg
+
+    # Validate developer errors early (clear message if signature is wrong)
     try:
+        sig = inspect.signature(plugin_func)
         sig.bind_partial(**kwargs_to_pass)
-        missing = [
-            p
-            for p, param in sig.parameters.items()
-            if (
-                param.default is inspect._empty
-                and param.kind
-                in (
-                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                    inspect.Parameter.KEYWORD_ONLY,
-                )
-                and p not in kwargs_to_pass
-            )
-        ]
-        if missing:
-            return f"Error: Plugin '{plugin_name}' missing required args: {', '.join(missing)}"
     except TypeError as e:
-        return f"Error: Cannot call plugin '{plugin_name}': {e}"
+        return (
+            f"Error: Plugin '{plugin_name}' must implement "
+            f"{plugin_name}(state, chat_history=None, arg=None): {e}"
+        )
 
     sandbox = PluginSandbox(plugin_name, plugin_func, (), kwargs_to_pass)
     sandbox.start()
@@ -720,16 +692,22 @@ def handle_command(
         active_sandboxes[plugin_name] = sandbox
 
     def _stream() -> Generator[Union[str, List[Dict[str, str]]], None, None]:
+        """
+        Stream sandbox output to caller with idle-timeout and cooperative stop.
+        """
         try:
-            start = time.time()
-            max_seconds = 3600
+            last_activity = time.time()
+            max_idle_seconds = 7200  # 2 hours inactivity ⇒ timeout
+
             while True:
                 try:
                     item = sandbox.output_queue.get(timeout=0.05)
                 except Empty:
-                    if (time.time() - start) > max_seconds:
-                        raise TimeoutError(f"Plugin '{plugin_name}' timed out after {max_seconds}s")
+                    if (time.time() - last_activity) > max_idle_seconds:
+                        raise TimeoutError(f"Plugin '{plugin_name}' idle for >{max_idle_seconds}s")
                     continue
+
+                last_activity = time.time()
 
                 if item is None:
                     break
@@ -742,14 +720,12 @@ def handle_command(
                 elif isinstance(item, dict):
                     msgs = [item]
                 else:
-                    # Fallback: render as text, wrap into a single assistant message
                     try:
                         text = format_json_for_chat(item) if isinstance(item, (dict, list)) else str(item)
                     except Exception:
                         text = str(item)
                     msgs = [{"role": "assistant", "content": (text or "").strip(), "metadata": {}}]
 
-                # Stamp plugin and default title into metadata; ensure role/content sane
                 out: List[Dict[str, Any]] = []
                 for m in msgs:
                     role = (m.get("role") or "assistant").strip().lower()
@@ -770,7 +746,6 @@ def handle_command(
             with sandboxes_lock:
                 active_sandboxes.pop(plugin_name, None)
 
-
     return _stream()
 
 
@@ -790,7 +765,7 @@ def process_input(
     Commands: caller must not append a user bubble for dot-commands;
               this function produces assistant-only output for them.
     """
-    # MIL: INPUT VALIDATION – PREVENT TYPE/SHAPE ERRORS EARLY.
+    # INPUT VALIDATION – PREVENT TYPE/SHAPE ERRORS EARLY.
     text = (user_text or "").strip()
     if not text:
         return
@@ -798,7 +773,7 @@ def process_input(
         raise TypeError("chat_history must be List[Dict[str, str]]")
     state = state if isinstance(state, dict) else {}
 
-    # MIL: LOCAL EMITTER – APPEND/EXTEND ASSISTANT CHUNK AND YIELD.
+    # LOCAL EMITTER – APPEND/EXTEND ASSISTANT CHUNK AND YIELD.
     def _emit_chunk(chunk: str) -> Generator[List[Dict[str, str]], None, None]:
         piece = (chunk or "").rstrip("\x00")
         if not piece:
@@ -810,7 +785,7 @@ def process_input(
         print(piece, end="", flush=True)
         yield list(chat_history)
 
-    # MIL: DOT-COMMANDS – ASSISTANT-ONLY OUTPUT; NO USER BUBBLE HERE.
+    # DOT-COMMANDS – ASSISTANT-ONLY OUTPUT; NO USER BUBBLE HERE.
     if text.startswith("."):
         try:
             result = handle_command(text, chat_history, state=state, is_gradio=True)
@@ -851,7 +826,7 @@ def process_input(
                     yield out
         return
 
-    # MIL: QUERY ENGINE – PREFER STREAM; SAFE FALLBACK TO LLM.
+    # QUERY ENGINE – PREFER STREAM; SAFE FALLBACK TO LLM.
     app_state = load_state()
     use_qe = bool(state.get("use_query_engine_gr", True))
     qe = getattr(app_state, "QUERY_ENGINE", None)
@@ -898,7 +873,7 @@ def process_input(
     if isinstance(llm, _HFL_TYPE):
         from transformers import TextIteratorStreamer
 
-        # MIL: SUPPORT BOTH PRIVATE AND PUBLIC ATTR NAMES
+        # SUPPORT BOTH PRIVATE AND PUBLIC ATTR NAMES
         model = getattr(llm, "_model", None) or getattr(llm, "model", None)
         tok = getattr(llm, "_tokenizer", None) or getattr(llm, "tokenizer", None)
         if model is None or tok is None:
@@ -930,7 +905,7 @@ def process_input(
         enc = tok(prompt, return_tensors="pt", add_special_tokens=True)
         ids = enc.get("input_ids")
         if ids is None or ids.numel() == 0 or ids.shape[-1] == 0:
-            # MIL: NON-EMPTY GUARD — PREVENTS CACHE-POSITION BUG PATH.
+            # NON-EMPTY GUARD — PREVENTS CACHE-POSITION BUG PATH.
             fid = (
                 int(getattr(tok, "bos_token_id"))
                 if getattr(tok, "bos_token_id", None) is not None
@@ -943,7 +918,7 @@ def process_input(
             if attn is None:
                 attn = torch.ones_like(ids, dtype=torch.long)
 
-        # MIL: MOVE TO DEVICE W/O DTYPE CAST (EMBEDDING EXPECTS LONG)
+        # MOVE TO DEVICE W/O DTYPE CAST (EMBEDDING EXPECTS LONG)
         ids = ids.to(device)
         attn = attn.to(device)
         if ids.dtype is not torch.long:
@@ -963,12 +938,12 @@ def process_input(
 
         streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
 
-        # MIL: ENFORCE CONFIGURED TOKEN BUDGET (NO 256 FALLBACK) + SYNC WRAPPER CAPS
+        # ENFORCE CONFIGURED TOKEN BUDGET (NO 256 FALLBACK) + SYNC WRAPPER CAPS
         target_tokens = int(MAX_NEW_TOKENS)
         try:
             if hasattr(llm, "max_new_tokens"):
                 llm.max_new_tokens = target_tokens
-            # MIL: SANITIZE WRAPPER GENERATE_KWARGS TO AVOID DUPLICATE max_new_tokens MERGE IN LlamaIndex
+            # SANITIZE WRAPPER GENERATE_KWARGS TO AVOID DUPLICATE max_new_tokens MERGE IN LlamaIndex
             if hasattr(llm, "generate_kwargs") and isinstance(
                 llm.generate_kwargs, dict
             ):
@@ -1344,7 +1319,7 @@ def handle_load_button(
 
     Returns updated chatbot history and UI state, never raising to UI.
     """
-    # MIL: ALWAYS RETURN A LIST (UI STABILITY)
+    # ALWAYS RETURN A LIST (UI STABILITY)
     chat_history: List[Dict[str, str]] = []
 
     app_state = load_state()
@@ -1359,7 +1334,7 @@ def handle_load_button(
         }
     )
 
-    # MIL: NO-OP IF DB IS ALREADY LOADED (DEDUPLICATION)
+    # NO-OP IF DB IS ALREADY LOADED (DEDUPLICATION)
     if state_dict.get("database_loaded_gr", False):
         append_to_chatbot(
             chat_history, "Database already loaded.", metadata={"role": "assistant"}
@@ -2047,7 +2022,7 @@ def cli_loop() -> None:
         assistant_buffer: str = ""
         last_len: int = 0
 
-        # MIL: isolate a live panel per response to avoid flicker across turns
+        # isolate a live panel per response to avoid flicker across turns
         with Live(
             Panel(
                 Markdown("", code_theme="monokai"),
@@ -2112,7 +2087,7 @@ def cli_loop() -> None:
                     continue
 
                 # Unknown snapshot type → ignore (precise, no blanket except)
-                # MIL: Do not raise; generators may yield control sentinels in some plugin paths.
+                # Do not raise; generators may yield control sentinels in some plugin paths.
 
         console.print("")
 
