@@ -605,14 +605,17 @@ def unload_model() -> str:
         logger.error(f"Unload failed: {e}")
         return f"Error unloading model: {str(e)}"
 
-
 def filtered_query_engine(
     llm,
     query_str: str,
     category: str,
+    system_prompt: Optional[str] = None,
 ) -> RetrieverQueryEngine:
-    """
-    Category-restricted query engine with no post-retrieval chunking.
+    """Category-restricted query engine with optional system prompt.
+
+    - If `system_prompt` is provided (non-empty string), it is prepended to the
+      default QA template for this engine instance.
+    - Otherwise the existing QA_PROMPT is used unchanged.
     """
     if state_manager.get_state("INDEX") is None:
         logger.critical("Index not initialized")
@@ -645,7 +648,7 @@ def filtered_query_engine(
         except Exception as e:
             logger.debug(f"(UDB) Unable to set token cap on LLM wrapper: {e}")
 
-        # Metadata filter (only effective if your nodes contain 'category' in metadata)
+        # Metadata filter (requires nodes to have 'category' in metadata)
         meta_filters = MetadataFilters(
             filters=[
                 MetadataFilter(
@@ -659,21 +662,26 @@ def filtered_query_engine(
         index = state_manager.get_state("INDEX")
         retriever = index.as_retriever(similarity_top_k=2, filters=meta_filters)
 
-        # Configure synthesizer with provided llm and QA prompt so outputs aren't clamped
+        # Choose prompt template (override if system_prompt provided)
+        sys_text = (system_prompt or "").strip()
+        if sys_text:
+            custom_template = PromptTemplate(f"{sys_text}\n{QA_PROMPT_TMPL}")
+        else:
+            custom_template = QA_PROMPT
+
+        # Build the query engine
         query_engine = RetrieverQueryEngine.from_args(
             retriever=retriever,
             llm=llm,
             node_postprocessors=[SimilarityPostprocessor(similarity_cutoff=0.65)],
             response_mode="compact",
-            text_qa_template=QA_PROMPT,
+            text_qa_template=custom_template,
             streaming=False,
         )
         return query_engine
     except Exception as exc:
         logger.error(f"(UDB) filtered_query_engine failed: {exc}")
         raise
-
-
 
 def clear_vram() -> None:
     """Clear VRAM with retry loop for CUDA errors."""
