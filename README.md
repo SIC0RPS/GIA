@@ -1,12 +1,12 @@
 # GIA
-> ### Chat with AI in your browser or terminal, using your own models, online models, your own data, and your own plugins.
+It runs on your own hardware with local models or connects to APIs like OpenAI HuggingFace and OpenRouter with dynamic model selection. You can work with your own data build custom plugins run quantized models via GPTQModel and load `.safetensors` models directly through the Gradio UI no coding required.
+
+> ### Chat with AI in your browser or terminal, using local or online models, your data, and your own plugins.
 
 - Web chat UI (Gradio) and terminal interface, always in sync.  
 - Load models stored on your machine, or connect to APIs like OpenAI, Hugging Face, or OpenRouter.  
 - Give it files (PDFs, text) — it uses them for answers.  
 - Add your own tools with simple Python plugins.  
-
-It runs on your own hardware with local models or connects to APIs like OpenAI HuggingFace and OpenRouter with dynamic model selection. You can work with your own data build custom plugins run quantized models via GPTQModel and load `.safetensors` models directly through the Gradio UI no coding required.
 
 ## Features
 
