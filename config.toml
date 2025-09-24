@@ -9,8 +9,8 @@ max_new_tokens = 2048
 temperature = 0.7
 top_p = 0.8
 top_k = 20
-repetition_penalty = 1.15
-no_repeat_ngram_size = 5
+repetition_penalty = 1.08
+no_repeat_ngram_size = 4
 
 [general]
 debug = true

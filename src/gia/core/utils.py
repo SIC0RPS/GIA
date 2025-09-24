@@ -10,7 +10,10 @@ from typing import Tuple, Optional, Dict, Any, List, Iterable, Generator, Callab
 import tiktoken
 import psutil
 import GPUtil
-import torch
+try:
+    import torch
+except Exception:
+    torch = None
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from pathlib import Path
@@ -36,7 +39,95 @@ from llama_index.core.vector_stores.types import (
 from llama_index.llms.openai import OpenAI as LlamaOpenAI
 from llama_index.llms.huggingface import HuggingFaceLLM
 from llama_index.llms.huggingface_api import HuggingFaceInferenceAPI
-from gptqmodel import GPTQModel, QuantizeConfig
+
+
+_CUDA_DISABLED_REASON: Optional[str] = None
+_CUDA_PATCHED = False
+_ENV_FORCE_CPU = os.getenv("GIA_FORCE_CPU", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _disable_cuda(reason: str) -> None:
+    """Force torch to report CUDA as unavailable so imports can proceed safely."""
+
+    global _CUDA_DISABLED_REASON, _CUDA_PATCHED
+    if _CUDA_DISABLED_REASON is None:
+        _CUDA_DISABLED_REASON = reason
+
+    if _CUDA_PATCHED:
+        return
+
+    _CUDA_PATCHED = True
+
+    try:
+        import torch as _torch
+
+        if hasattr(_torch, "cuda") and hasattr(_torch.cuda, "is_available"):
+            _torch.cuda.is_available = lambda: False  # type: ignore[assignment]
+        if hasattr(_torch.cuda, "device_count"):
+            _torch.cuda.device_count = lambda: 0  # type: ignore[assignment]
+    except Exception:
+        pass
+
+
+def _ensure_torch_device() -> bool:
+    """Return True if CUDA is usable; otherwise force CPU fallback."""
+
+    if _ENV_FORCE_CPU:
+        _disable_cuda("GIA_FORCE_CPU requested")
+        return False
+
+    if torch is None or not hasattr(torch, "cuda"):
+        return False
+
+    if not torch.cuda.is_available():
+        return False
+
+    try:
+        # Ensure at least device 0 can execute a simple operation.
+        with torch.cuda.device(0):
+            _ = torch.empty(1, device="cuda")
+        return True
+    except Exception as exc:  # Broad to catch CUDA driver/runtime issues
+        _disable_cuda(f"CUDA initialization failed: {exc}")
+        return False
+
+
+_HAS_USABLE_CUDA = _ensure_torch_device()
+
+if (
+    torch is not None
+    and hasattr(torch, "cuda")
+    and hasattr(torch.cuda, "OutOfMemoryError")
+):
+    TorchOOMError = torch.cuda.OutOfMemoryError  # type: ignore[assignment]
+else:  # torch absent or CPU-only build
+    class TorchOOMError(RuntimeError):
+        """Fallback OOM error type when torch CUDA is unavailable."""
+
+        pass
+
+
+def _cuda_empty_cache() -> None:
+    """Clear CUDA cache if torch with CUDA support is available."""
+
+    if torch is None or not hasattr(torch, "cuda"):
+        return
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _cuda_synchronize() -> None:
+    """Synchronize CUDA device if available."""
+
+    if torch is None or not hasattr(torch, "cuda"):
+        return
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+
 from llama_index.llms.openrouter import OpenRouter
 from llama_index.readers.file import PDFReader
 
@@ -46,6 +137,12 @@ from gia.core.state import state_manager, load_state
 import chromadb
 
 log_banner(__file__)
+
+if _CUDA_DISABLED_REASON:
+    logger.warning(
+        "CUDA detected but unusable (%s). Falling back to CPU; set GIA_FORCE_CPU=1 to disable auto-detect.",
+        _CUDA_DISABLED_REASON,
+    )
 
 CONTEXT_WINDOW = CONFIG["CONTEXT_WINDOW"]
 MAX_NEW_TOKENS = CONFIG["MAX_NEW_TOKENS"]
@@ -59,7 +156,7 @@ EMBED_MODEL_PATH = CONFIG["EMBED_MODEL_PATH"]
 DATA_PATH = CONFIG["DATA_PATH"]
 DB_PATH = CONFIG["DB_PATH"]
 DEBUG = CONFIG["DEBUG"]
-DEVICE_MAP: str = "cuda" if __import__("torch").cuda.is_available() else "cpu"
+DEVICE_MAP: str = "cuda" if _HAS_USABLE_CUDA else "cpu"
 
 
 def _hash_text(s: str) -> str:
@@ -256,9 +353,9 @@ def save_database():
     start_time = time.time()
 
     try:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cuda" if _HAS_USABLE_CUDA else "cpu"
         logger.info(f"Using device: {device}")
-        torch.cuda.empty_cache()
+        _cuda_empty_cache()
 
         # Ensure DB path exists
         Path(DB_PATH).mkdir(parents=True, exist_ok=True)
@@ -344,7 +441,7 @@ def save_database():
                 for sub_start in range(0, len(batch_nodes), sub_batch_size):
                     sub_batch = batch_nodes[sub_start : sub_start + sub_batch_size]
                     index.insert_nodes(sub_batch)
-                    torch.cuda.empty_cache()
+                    _cuda_empty_cache()
 
                 logger.info(f"Completed batch: {len(batch_nodes)} nodes inserted")
                 logger.info(
@@ -355,7 +452,7 @@ def save_database():
                 logger.error(
                     f"Error in batch {batch_start // file_batch_size + 1}: {e}"
                 )
-                torch.cuda.empty_cache()
+                _cuda_empty_cache()
                 continue
 
         elapsed_time = time.time() - start_time
@@ -400,7 +497,7 @@ def load_database(llm: Optional[object] = None) -> str:
         )
 
         # Embeddings
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cuda" if _HAS_USABLE_CUDA else "cpu"
         embed_model = _init_embed_model(device)
 
         # Vector store & index
@@ -507,7 +604,7 @@ def update_database(
 
     model = embed_model or state.EMBED_MODEL
     if model is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cuda" if _HAS_USABLE_CUDA else "cpu"
         model = _init_embed_model(device)
 
     splitter = SentenceSplitter(chunk_size=512, chunk_overlap=50)
@@ -685,14 +782,21 @@ def filtered_query_engine(
 
 def clear_vram() -> None:
     """Clear VRAM with retry loop for CUDA errors."""
-    original_benchmark = torch.backends.cudnn.benchmark
-    torch.backends.cudnn.benchmark = False
+    if torch is None or not hasattr(torch, "cuda"):
+        gc.collect()
+        return
+
+    original_benchmark = getattr(torch.backends.cudnn, "benchmark", False)
+    try:
+        torch.backends.cudnn.benchmark = False
+    except Exception:
+        original_benchmark = False
     retries = 3
     for attempt in range(retries):
         try:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+            if _HAS_USABLE_CUDA:
+                _cuda_synchronize()
+            _cuda_empty_cache()
             gc.collect()
             cpu_usage, memory_usage, gpu_usage = get_system_info()  # FIXED UNPACKING
             if memory_usage > 80 or any(g > 80 for g in gpu_usage):
@@ -714,7 +818,10 @@ def clear_vram() -> None:
                 logger.error(f"VRAM clear failed after {retries} attempts: {e}")
                 raise
         finally:
-            torch.backends.cudnn.benchmark = original_benchmark
+            try:
+                torch.backends.cudnn.benchmark = original_benchmark
+            except Exception:
+                pass
 
 
 def clear_ram(
@@ -1406,7 +1513,7 @@ def generate(
         )
         return text_out
 
-    except torch.cuda.OutOfMemoryError as e:
+    except TorchOOMError as e:
         logger.warning(
             f"Error: OOM during generation - {e}. Reduce max_tokens or clear VRAM."
         )
