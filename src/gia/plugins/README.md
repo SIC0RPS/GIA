@@ -2,69 +2,100 @@
 
 ## Placement
 - Path: `src/gia/plugins/<name>/<name>.py`
-- Function name = folder name = file name
+- Folder name, module name, and exported function must match (`myplugin/myplugin.py` → `def myplugin(...)`).
 
 ## Loading
-- Auto-loaded at startup by `load_plugins()`
-- Run with `.name` in CLI or click in UI
+- Auto-loaded at startup by `gia.GIA.load_plugins()`.
+- Invoke from chat with `.name` or click the plugin button in the UI.
 
 ## Function Signature
 ```python
-def myplugin(llm, query_engine, embed_model, chat_history, arg=None):
+from typing import Dict, List, Optional
+from gia.core.state import ProjectState
+
+def myplugin(
+    state: ProjectState,
+    chat_history: Optional[List[Dict[str, str]]] = None,
+    arg: Optional[str] = None,
+):
     ...
-````
+```
+- `state`: read-only snapshot with handles such as `state.LLM`, `state.QUERY_ENGINE`, `state.EMBED_MODEL`, `state.MODEL_NAME`.
+- `chat_history`: list of prior messages (`[{"role": str, "content": str, "metadata": dict}]`) or `None`.
+- `arg`: optional string captured from `.myplugin value`.
+
+GIA binds these arguments by keyword. Missing or renamed parameters trigger a validation error before execution.
 
 ## Core Usage
+- Call `generate()` (or `stream_generate()`) for LLM work.
+- Use `yield` to stream progress; return a string/list for one-shot results.
+- Catch exceptions and surface readable errors with `yield "Error: ..."` or `return "Error: ..."`.
 
-* Use `generate()` for LLM calls
-* Use `yield` to stream output
-* Catch exceptions → `yield "Error: ..."`
+## State Handles
+Access runtime components through `state` only:
+- `state.LLM`
+- `state.QUERY_ENGINE`
+- `state.EMBED_MODEL`
+- `state.MODEL_NAME`
+- `state.DATABASE_LOADED`
 
-## State Variables
-
-* `llm` → current model (`state.LLM`)
-* `query_engine` → RAG engine (`state.QUERY_ENGINE`)
-* `embed_model` → embedding model
-* `chat_history` → full conversation list
+Treat them as read-only. Avoid storing the snapshot for reuse outside the function.
 
 ## Example
-
 ```python
-from gia.core import generate
+from typing import Dict, List, Optional
 from gia.core.logger import logger, log_banner
+from gia.core.state import ProjectState
+from gia.core.utils import generate
+from gia.config import system_prefix
 
 log_banner(__file__)
 
-def myplugin(llm, query_engine, embed_model, chat_history, arg=None):
-    yield "MyPlugin started."
-    try:
-        prompt = arg or "What's the weather on Mars?"
-        resp = generate(prompt, "You are a helpful assistant.", llm, max_new_tokens=100)
-        yield f"LLM says: {resp}"
-    except Exception as e:
-        logger.error(f"Error in myplugin: {e}")
-        yield f"Error: {str(e)}"
+def myplugin(
+    state: ProjectState,
+    chat_history: Optional[List[Dict[str, str]]] = None,
+    arg: Optional[str] = None,
+):
+    llm = state.LLM
+    if llm is None:
+        yield "Error: Load a model first (.load)."
+        return
+
+    topic = (arg or "What's the weather on Mars?").strip()
+    yield f"Working on: {topic}"
+
+    response = generate(
+        query=topic,
+        system_prompt=system_prefix(),
+        llm=llm,
+        max_new_tokens=256,
+    )
+    yield f"LLM says: {response}"
+
+    logger.info("myplugin completed for topic=%s", topic)
 ```
 
 ## Key Points
-- Correct path and naming are mandatory  
-- Plugins run in isolated threads (safe)  
-- UI auto-lists plugins (clickable)  
-- `arg` is optional string passed by user  
-# GIA Plugin System — Quick Guide
+- Path + naming must align or the loader skips the plugin.
+- Plugins run inside sandbox threads; always stream status for long jobs.
+- The UI lists available plugins automatically.
+- `arg` is optional; validate it before use.
+
+# GIA Plugin System — Developer Guide
 
 ## Placement & Naming
-- Put each plugin in `src/gia/plugins/<name>/<name>.py`.
-- The exported function must be named exactly `<name>`.
-- Example: `src/gia/plugins/minidemo/minidemo.py` exports `def minidemo(...):`.
+- Each plugin lives in `src/gia/plugins/<name>/`.
+- Entry file: `<name>.py` with `def <name>(...)`.
+- Optional helpers can live beside the entry file; they must not conflict with other plugin names.
 
 ## Loading & Running
-- GIA auto-discovers plugins at startup; no manual registration required.
-- Run via chat with dot-commands (e.g., `.minidemo topic here`) or click in the UI list.
+- Plugins load when GIA starts or when `.reload` (if implemented) runs.
+- Users trigger plugins via dot-commands (`.name optional-arg`).
+- The loader inspects signatures with `inspect.signature(...).bind_partial(state=..., chat_history=..., arg=...)` and raises clear errors on mismatch.
 
-## Standard Signature
+## Standard Signature Recap
 ```python
-from typing import List, Dict, Optional, Generator
+from typing import Dict, List, Optional, Generator
 from gia.core.state import ProjectState
 
 def myplugin(
@@ -74,24 +105,27 @@ def myplugin(
 ) -> Generator[List[Dict[str, str]], None, None] | str:
     ...
 ```
-- `state`: read-only snapshot with `LLM`, `QUERY_ENGINE`, `EMBED_MODEL`, `MODEL_NAME`, etc.
-- `chat_history`: the full session history (list of `{role, content, metadata}` dicts).
-- `arg`: optional single CLI argument string passed by the user.
-- Return a generator and `yield` message batches to stream into the UI, or return a single `str`.
+- Return a generator to stream (`yield` lists of messages), or return a single `str`/list/dict for immediate results.
+- When yielding dicts, include at least `role` and `content`; the sandbox stamps missing metadata (`plugin`, `title`).
 
 ## Message Shape for Yields
-Yield lists of chat messages compatible with `gr.Chatbot(type="messages")`:
 ```python
-[{"role": "assistant", "content": "text", "metadata": {"plugin": "myplugin"}}]
+[
+    {
+        "role": "assistant",
+        "content": "Chunk text",
+        "metadata": {"plugin": "myplugin"}
+    }
+]
 ```
-- Roles: `assistant`, `user`, or `system`.
-- Metadata is optional; include `{"plugin": "<name>"}` if helpful.
+- Roles: `assistant`, `user`, `system`.
+- `metadata` is optional; avoid non-serializable types.
 
 ## Minimal Streaming Example
 ```python
-from typing import List, Dict, Optional, Generator
+from typing import Dict, List, Optional, Generator
 from gia.core.state import ProjectState
-from gia.core.logger import logger, log_banner
+from gia.core.logger import log_banner
 
 log_banner(__file__)
 
@@ -102,7 +136,7 @@ def minidemo(
 ) -> Generator[List[Dict[str, str]], None, None]:
     yield [{"role": "assistant", "content": "Starting demo…", "metadata": {"plugin": "minidemo"}}]
     for i in range(3):
-        yield [{"role": "assistant", "content": f"Chunk {i+1}/3", "metadata": {"plugin": "minidemo"}}]
+        yield [{"role": "assistant", "content": f"Chunk {i + 1}/3", "metadata": {"plugin": "minidemo"}}]
 ```
 
 ## One‑Shot Example Using `generate`
@@ -124,42 +158,39 @@ def oneshot(state: ProjectState, chat_history=None, arg: Optional[str] = None) -
 ## Logger Integration
 ```python
 from gia.core.logger import logger, log_banner
+
 log_banner(__file__)
 logger.info("Plugin loaded")
 logger.debug("Details…")
 logger.error("Something went wrong")
 ```
-All plugin logs go to the main application log pipeline.
+All plugin logs flow into the main application log pipeline.
 
 ## Safe State Usage
-- Access `state.*` inside your function only; do not reference `state` at import time.
-- Use `state.LLM`, `state.QUERY_ENGINE`, `state.EMBED_MODEL` read‑only.
-- For cross‑plugin flags, use `state_manager.get_state/set_state` sparingly; avoid mutating core handles.
+- Touch `state.*` only inside the entrypoint; never reference it at import time.
+- Treat `state.LLM`, `state.QUERY_ENGINE`, `state.EMBED_MODEL`, etc. as read-only.
+- For cross-plugin coordination use `state_manager` sparingly; avoid mutating core handles.
 
 ## System Prompts
-- Global default comes from `config.toml` `[prompt].system_prompt` (string or list of strings).
-- Use `from gia.config import system_prefix` to fetch the default at runtime.
-- You can override per‑call via helper function parameters (see below).
+- Global default comes from `config.toml` `[prompt].system_prompt`.
+- Call `system_prefix()` to fetch it at runtime.
+- Override per call as needed.
 
 ## Generation Helpers (utils.py)
-Two helper functions manage token budgets, device safety, and provider quirks.
-
 ```python
 from gia.core.utils import generate, stream_generate
 from gia.config import system_prefix
 
-system = system_prefix()  # default system prompt from config.toml
+system = system_prefix()
 
-# Non‑streaming (retries on OOM by halving budget)
 text = generate(
     query="Your question here",
     system_prompt=system,
     llm=state.LLM,
-    max_new_tokens=512,      # optional; defaults to CONFIG["MAX_NEW_TOKENS"]
-    think=False,             # Qwen3/CyberSic: set True to add /think, False adds /no_think
+    max_new_tokens=512,
+    think=False,
 )
 
-# Stream‑first (falls back to non‑stream if needed), returns final text
 text_streamed = stream_generate(
     query="Stream a short poem",
     system_prompt=system,
@@ -168,14 +199,11 @@ text_streamed = stream_generate(
     think=False,
 )
 ```
-
 Notes:
-- `max_new_tokens` is respected per provider; helpers sanitize wrapper kwargs and restore caps.
-- `think=True` automatically adds a control tag for Qwen3/CyberSic models.
+- Helpers manage provider quirks and retry on OOM.
+- `think=True` injects `/think` control tags for supported models; `False` uses `/no_think`.
 
 ## Filtered RAG Query Engine
-Use `filtered_query_engine` to query a category‑filtered vector index. Your nodes must have `{"category": "<value>"}` metadata at ingestion time.
-
 ```python
 from gia.core.utils import filtered_query_engine
 from gia.config import system_prefix
@@ -185,7 +213,7 @@ def rag_demo(state: ProjectState, chat_history=None, arg=None):
     if llm is None or state.QUERY_ENGINE is None:
         return "Error: Load a model (.load) and database (.load) first."
 
-    category = "python"  # must match node metadata
+    category = "python"
     user_query = arg or "Explain list comprehensions."
     system = system_prefix()
 
@@ -193,35 +221,34 @@ def rag_demo(state: ProjectState, chat_history=None, arg=None):
         llm=llm,
         query_str=user_query,
         category=category,
-        system_prompt=system,  # optional; prepends to QA template
+        system_prompt=system,
     )
     resp = qe.query(user_query)
     return getattr(resp, "response", str(resp))
 ```
-
-To ingest with categories, call `update_database(filepaths, query, metadata={"category": "python", "tags": ["..."]})`.
+To ingest with categories, call `update_database(filepaths, query, metadata={"category": "python"})`.
 
 ## Yielding vs Returning
-- For streaming UI updates, implement a generator and `yield` lists of messages.
-- For simple, immediate results, return a single `str`.
-- GIA normalizes plugin outputs and displays them in the chat.
+- Streaming UI updates → generator + `yield` (strings or message lists).
+- Simple result → return a string/list/dict.
+- The sandbox normalizes outputs and appends metadata when missing.
 
 ## Security & Best Practices
-- Treat `arg` as untrusted input; validate before use.
-- Prefer pure‑Python logic; avoid `exec`/`eval` and unsafe shell calls.
-- Catch exceptions and return/readably yield error messages.
-- Keep outputs concise and incremental to maintain a responsive UI.
+- Treat `arg` and file inputs as untrusted; validate before use.
+- Prefer pure Python helpers; avoid `exec`, `eval`, and unsafe shell calls.
+- Catch exceptions and surface readable messages to the user.
+- Keep outputs concise to maintain responsive UI updates.
 
 ## Troubleshooting
-- Plugin not found: folder/file/function names must match (`plugins/<name>/<name>.py` with `def <name>(...)`).
-- No output in UI: ensure you return a `str` or yield lists of message dicts.
-- “Error: No model loaded”: run `.load` to initialize an LLM first.
-- Filtered RAG returns nothing: verify your DB nodes contain `{"category": "..."}` metadata that matches your filter.
+- Plugin missing: folder/file/function names must match exactly.
+- No output: ensure you yield lists or return a string.
+- “Error: Load a model first” → run `.load` to initialize the LLM.
+- Filtered RAG empty: confirm your database nodes have matching `category` metadata.
 
 ## Minimal Template (Copy/Paste)
 ```python
 # src/gia/plugins/_template/_template.py
-from typing import List, Dict, Optional, Generator
+from typing import Dict, List, Optional, Generator
 from gia.core.state import ProjectState
 from gia.core.utils import generate
 from gia.core.logger import logger, log_banner
@@ -245,5 +272,8 @@ def _template(
     yield [{"role": "assistant", "content": f"Generating about: {topic}"}]
     text = generate(query=topic, system_prompt=system, llm=llm, max_new_tokens=256, think=False)
     yield [{"role": "assistant", "content": text, "metadata": {"plugin": "_template"}}]
+
+    logger.info("_template finished topic=%s", topic)
 ```
 
+Stick to these conventions and your plugins will integrate cleanly with the GIA runtime.

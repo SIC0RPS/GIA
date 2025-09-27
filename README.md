@@ -123,7 +123,7 @@ For persistent PowerShell setup, edit your profile file (`$PROFILE`).
 
 GIA starts by loading your selected model (local or online), any RAG database, and plugins. You can interact via CLI or UI, with both interfaces staying synchronized.
 
-- Commands starting with a dot (e.g., `.myplugin`) trigger plugins; all other inputs are treated as queries to the LLM.
+- Commands starting with a dot (e.g., `.myplugins_example`) trigger plugins; all other inputs are treated as queries to the LLM.
 - Plugins execute in separate threads to prevent crashes from affecting the main application.
 - Data remains local by default, except when using online APIs or plugins that explicitly send data externally.
 - **OpenAI**: Uses OPENAI_API_KEY for authentication; supports dynamic selection from all available models and api_base for custom endpoints.
@@ -169,44 +169,64 @@ Extend GIA by adding custom plugins:
 
 1. **Create Folder**:
    ```
-   mkdir -p src/gia/plugins/myplugin/
+   mkdir -p src/gia/plugins/myplugins_example/
    ```
 
 2. **Add File**:
    ```
-   touch src/gia/plugins/myplugin/myplugin.py
+   touch src/gia/plugins/myplugins_example/myplugins_example.py
    ```
 
-3. **Define Function**: The function name must match the folder name.
+3. **Define Function**: The function name must match the folder name and accept a `ProjectState` snapshot (this is enforced by the loader at runtime).
    ```python
-   def myplugin(llm, query_engine, embed_model, chat_history, arg=None):
+   from typing import Dict, List, Optional
+   from gia.core.state import ProjectState
+
+   def myplugins_example(
+       state: ProjectState,
+       chat_history: Optional[List[Dict[str, str]]] = None,
+       arg: Optional[str] = None,
+   ) -> str:
        ...
    ```
    - **Arguments**:
-     - `llm`: The loaded model.
-     - `query_engine`: RAG engine (if a database is loaded).
-     - `embed_model`: Embedding model for RAG.
-     - `chat_history`: List of previous messages.
-     - `arg`: Optional argument from UI/CLI.
-   - **Output**: Use `yield` to send strings back to the UI/CLI.
+     - `state`: read-only access to handles such as `state.LLM`, `state.QUERY_ENGINE`, and `state.EMBED_MODEL`.
+     - `chat_history`: list of prior chat messages (optional).
+     - `arg`: optional argument from UI/CLI (e.g., `.myplugins_example topic`).
+   - **Output**: Return a string for simple results, or `yield` chunks (strings or `{role, content, metadata}` dicts) to stream progress back into the UI.
+
+See `src/gia/plugins/README.md` for a deeper dive into plugin architecture, streaming patterns, and development tips.
 
 **Example Plugin**:
 ```python
-from gia.core.logger import logger, log_banner
-from gia.core import generate
+from typing import Dict, List, Optional
+from gia.config import system_prefix
+from gia.core.utils import generate
+from gia.core.logger import log_banner
+from gia.core.state import ProjectState
 
 log_banner(__file__)
 
-def myplugin(llm, query_engine, embed_model, chat_history, arg=None):
-    yield "MyPlugin started."
-    try:
-        prompt = "What's the weather like on Mars?"
-        system_prompt = "You are a helpful assistant."
-        response = generate(prompt, system_prompt, llm, max_new_tokens=256)
-        yield f"LLM says: {response}"
-    except Exception as e:
-        logger.error(f"Error in myplugin: {e}")
-        yield f"Error: {str(e)}"
+def myplugins_example(
+    state: ProjectState,
+    chat_history: Optional[List[Dict[str, str]]] = None,
+    arg: Optional[str] = None,
+):
+    llm = state.LLM
+    if llm is None:
+        yield "Error: Load a model first (.load)."
+        return
+
+    topic = arg or "quick status update"
+    yield f"Starting run for: {topic}"
+
+    response = generate(
+        query=f"Summarize: {topic}",
+        system_prompt=system_prefix(),
+        llm=llm,
+        max_new_tokens=256,
+    )
+    yield response
 ```
 
 - Edit the file as needed; changes are auto-detected on reload.
