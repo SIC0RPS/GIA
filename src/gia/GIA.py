@@ -697,14 +697,21 @@ def handle_command(
         """
         try:
             last_activity = time.time()
-            max_idle_seconds = 7200  # 2 hours inactivity ⇒ timeout
+            raw_timeout = CONFIG.get("PLUGIN_IDLE_TIMEOUT_SECONDS", 0)
+            try:
+                timeout_value = float(raw_timeout)
+            except (TypeError, ValueError):
+                timeout_value = 0.0
+            max_idle_seconds: Optional[float] = timeout_value if timeout_value > 0 else None
 
             while True:
                 try:
                     item = sandbox.output_queue.get(timeout=0.05)
                 except Empty:
-                    if (time.time() - last_activity) > max_idle_seconds:
-                        raise TimeoutError(f"Plugin '{plugin_name}' idle for >{max_idle_seconds}s")
+                    if max_idle_seconds is not None and (time.time() - last_activity) > max_idle_seconds:
+                        raise TimeoutError(
+                            f"Plugin '{plugin_name}' idle for >{int(max_idle_seconds)}s"
+                        )
                     continue
 
                 last_activity = time.time()
@@ -1147,7 +1154,7 @@ def finalize_model_selection(
     elif mode == "OpenAI":
         config["model_name"] = state.get("openai_model_name", "gpt-4o")
     elif mode == "OpenRouter":
-        config["model_name"] = state.get("openrouter_model_name", "x-ai/grok-3-mini")
+        config["model_name"] = state.get("openrouter_model_name", "x-ai/grok-4-fast")
     else:
         error_msg = f"Invalid mode: {mode}"
         logger.error(error_msg)
@@ -1387,7 +1394,7 @@ def handle_load_button(
                 display_name = str(mn)
 
             elif mode == "OpenRouter":
-                mn = state_dict.get("openrouter_model_name") or "x-ai/grok-3-mini"
+                mn = state_dict.get("openrouter_model_name") or "x-ai/grok-4-fast"
                 config = {"model_name": mn}
                 display_name = str(mn)
 
@@ -1581,7 +1588,7 @@ def launch_app(args: argparse.Namespace) -> None:
                     "mode": "Local",
                     "hf_model_name": "deepseek-ai/DeepSeek-R1",
                     "openai_model_name": "gpt-3.5-turbo",
-                    "openrouter_model_name": "x-ai/grok-3-mini",
+                    "openrouter_model_name": "x-ai/grok-4-fast",
                 }
             )
 
@@ -1641,8 +1648,8 @@ def launch_app(args: argparse.Namespace) -> None:
                                 with gr.Column(scale=5):
                                     openrouter_model_text = gr.Textbox(
                                         label="OpenRouter Model",
-                                        value="x-ai/grok-3-mini",
-                                        placeholder="Enter OpenRouter model name (e.g., x-ai/grok-3-mini)",
+                                        value="x-ai/grok-4-fast",
+                                        placeholder="Enter OpenRouter model name (e.g., x-ai/grok-4-fast)",
                                     )
                                 with gr.Column(scale=1):
                                     confirm_openrouter_button = gr.Button("Confirm")
@@ -1846,7 +1853,7 @@ def launch_app(args: argparse.Namespace) -> None:
                 state_dict["model_path_gr"] = (selected_folder if mode == "Local" else None)
                 state_dict["hf_model_name"] = (hf_model if mode == "HuggingFace" else state_dict.get("hf_model_name", "deepseek-ai/DeepSeek-R1"))
                 state_dict["openai_model_name"] = (openai_model if mode == "OpenAI" else state_dict.get("openai_model_name", "gpt-3.5-turbo"))
-                state_dict["openrouter_model_name"] = (openrouter_model if mode == "OpenRouter" else state_dict.get("openrouter_model_name", "x-ai/grok-3-mini"))
+                state_dict["openrouter_model_name"] = (openrouter_model if mode == "OpenRouter" else state_dict.get("openrouter_model_name", "x-ai/grok-4-fast"))
                 try:
                     status, updated_state = finalize_model_selection(mode, state_dict)
                     logger.info(f"Model confirmation successful for mode {mode}")

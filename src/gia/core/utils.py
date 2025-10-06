@@ -4,9 +4,12 @@ import os
 import time
 import gc
 import hashlib
+import json
+import inspect
+from datetime import datetime
 import requests
 import tomllib
-from typing import Tuple, Optional, Dict, Any, List, Iterable, Generator, Callable
+from typing import Tuple, Optional, Dict, Any, List, Iterable, Generator, Callable, Union
 import tiktoken
 import psutil
 import GPUtil
@@ -44,6 +47,8 @@ from llama_index.llms.huggingface_api import HuggingFaceInferenceAPI
 _CUDA_DISABLED_REASON: Optional[str] = None
 _CUDA_PATCHED = False
 _ENV_FORCE_CPU = os.getenv("GIA_FORCE_CPU", "").strip().lower() in {"1", "true", "yes", "on"}
+
+PLUGIN_DIR = Path(__file__).resolve().parent
 
 
 def _disable_cuda(reason: str) -> None:
@@ -203,6 +208,166 @@ def append_to_chatbot(
     history.append(entry)
     return history
 
+
+def append_to_dataset(
+    *,
+    user: str,
+    assistant: str,
+    system: Optional[str] = None,
+    category: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[Path]:
+    """
+    Append a minimal SFT-style record to a per-plugin JSON file under ``<plugin>/datasets``.
+
+    Structure:
+      {
+        "messages": [
+          {"role": "system", "content": <system_if_any>},
+          {"role": "user", "content": user},
+          {"role": "assistant", "content": assistant}
+        ],
+        "meta": {
+          "id": <int>,          # monotonically increasing per file
+          "timestamp": <iso8601>,
+          "category": <str>     # present only if provided
+        }
+      }
+
+    Args:
+      user: The (augmented) user prompt.
+      assistant: The final assistant output.
+      system: Optional system prompt; if not provided, loaded from rules.json.
+      category: Optional logical label (e.g., "python"). Omitted when empty/None.
+      metadata: Optional mapping stored under the 'metadata' key.
+
+    Returns:
+      Path to the dataset file, or None if no plugin context could be resolved.
+    """
+    try:
+        plugin_root: Optional[Path] = None
+        dataset_path: Optional[Path] = None
+        plugins_root = (PROJECT_ROOT / "plugins").resolve()
+        stack = inspect.stack()[1:]
+        frame_info = None
+        try:
+            for frame_info in stack:
+                module = inspect.getmodule(frame_info.frame)
+                if not module:
+                    continue
+                plugin_dir = getattr(module, "PLUGIN_DIR", None)
+                if not isinstance(plugin_dir, Path):
+                    continue
+                resolved_plugin_dir = plugin_dir.resolve()
+                try:
+                    resolved_plugin_dir.relative_to(plugins_root)
+                except ValueError:
+                    continue
+
+                plugin_root = resolved_plugin_dir
+                configured_dataset = getattr(module, "DATASET_FILE", None)
+                if configured_dataset is not None:
+                    dataset_path = Path(configured_dataset)
+                    if not dataset_path.is_absolute():
+                        dataset_path = plugin_root / dataset_path
+                else:
+                    dataset_path = plugin_root / "datasets" / f"{plugin_root.name}.json"
+
+                if dataset_path is None:
+                    continue
+
+                dataset_path = dataset_path.resolve()
+                try:
+                    dataset_path.relative_to(plugin_root)
+                except ValueError:
+                    logger.warning(
+                        "(DATASET) Resolved dataset path %s is outside plugin directory %s; skipping.",
+                        dataset_path,
+                        plugin_root,
+                    )
+                    return None
+                break
+        finally:
+            del frame_info
+            del stack
+
+        if dataset_path is None or plugin_root is None:
+            logger.warning(
+                "(DATASET) Could not resolve plugin dataset directory from call stack; entry not saved."
+            )
+            return None
+
+        datasets_dir = dataset_path.parent
+        datasets_dir.mkdir(parents=True, exist_ok=True)
+        filename = dataset_path
+
+        try:
+            with filename.open("r", encoding="utf-8") as f:
+                dataset = json.load(f)
+            if not isinstance(dataset, list):
+                logger.warning("(DATASET) %s is not a list; resetting to empty.", filename)
+                dataset = []
+        except FileNotFoundError:
+            dataset = []
+        except json.JSONDecodeError as e:
+            logger.warning("(DATASET) Corrupt JSON in %s: %s; resetting to empty.", filename, e)
+            dataset = []
+
+        max_id = 0
+        for item in dataset:
+            if isinstance(item, dict):
+                meta = item.get("meta", {})
+                if isinstance(meta, dict):
+                    try:
+                        max_id = max(max_id, int(meta.get("id", 0)))
+                    except (TypeError, ValueError):
+                        continue
+        next_id = max_id + 1
+
+        sys_msg = ""
+        try:
+            sys_msg = (system or "").strip()
+            if not sys_msg:
+                sys_msg = ""
+        except Exception as e:
+            logger.debug(f"(DATASET) Failed to resolve system prompt: {e}")
+            sys_msg = ""
+
+        messages: list[dict[str, str]] = []
+        if sys_msg:
+            messages.append({"role": "system", "content": sys_msg})
+        messages.append({"role": "user", "content": str(user or "")})
+        messages.append({"role": "assistant", "content": str(assistant or "")})
+
+        meta_obj: dict[str, str | int] = {
+            "id": next_id,
+            "timestamp": datetime.now().isoformat(),
+        }
+        cat_clean = (category or "").strip()
+        if cat_clean:
+            meta_obj["category"] = cat_clean
+
+        entry: Dict[str, Any] = {"messages": messages, "meta": meta_obj}
+        if metadata:
+            entry["metadata"] = metadata
+
+        dataset.append(entry)
+        tmp_file = filename.with_suffix(".json.tmp")
+        with tmp_file.open("w", encoding="utf-8") as f:
+            json.dump(dataset, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        tmp_file.replace(filename)
+
+        logger.info(
+            "(DATASET) Appended id=%d to %s (total=%d)",
+            next_id,
+            filename,
+            len(dataset),
+        )
+        return filename
+    except Exception as e:
+        logger.error("(DATASET) Failed to append entry: %s", e)
+        raise
 
 def get_qa_prompt() -> str:
     """
@@ -1080,6 +1245,7 @@ def create_llm(mode: str, model_name: str) -> Optional[LLM]:
             temperature=float(TEMPERATURE),
             top_p=float(TOP_P),
             max_tokens=int(MAX_NEW_TOKENS),
+            context_window=int(CONTEXT_WINDOW),
         )
         state_manager.set_state("USE_CHAT", True)
         logger.info("OpenAI LLM ready.")
@@ -1093,6 +1259,7 @@ def create_llm(mode: str, model_name: str) -> Optional[LLM]:
             temperature=float(TEMPERATURE),
             top_p=float(TOP_P),
             max_tokens=int(MAX_NEW_TOKENS),
+            context_window=int(CONTEXT_WINDOW),
         )
         state_manager.set_state("USE_CHAT", True)
         logger.info("OpenRouter LLM ready.")
@@ -1223,6 +1390,7 @@ def create_llm(mode: str, model_name: str) -> Optional[LLM]:
             temperature=float(TEMPERATURE),
             top_p=float(TOP_P),
             max_tokens=int(MAX_NEW_TOKENS),
+            context_window=int(CONTEXT_WINDOW),
         )
         state_manager.set_state("USE_CHAT", True)
         logger.info("OpenAI LLM ready (cap via max_tokens in constructor).")
@@ -1236,6 +1404,7 @@ def create_llm(mode: str, model_name: str) -> Optional[LLM]:
             temperature=float(TEMPERATURE),
             top_p=float(TOP_P),
             max_tokens=int(MAX_NEW_TOKENS),
+            context_window=int(CONTEXT_WINDOW),
         )
         state_manager.set_state("USE_CHAT", True)
         logger.info("OpenRouter LLM ready (cap via max_tokens in constructor).")
@@ -1397,14 +1566,27 @@ def generate(
         else int(MAX_NEW_TOKENS)
     )
 
-    # Remove potential clamps from generate_kwargs so wrapper fields take effect and avoid duplicates
+    # Remove potential clamps from generate/additional kwargs so per-call fields take effect
+    generate_kwargs_snapshot = None
     try:
         if hasattr(llm, "generate_kwargs") and isinstance(llm.generate_kwargs, dict):
+            generate_kwargs_snapshot = llm.generate_kwargs.copy()
             llm.generate_kwargs.pop("max_new_tokens", None)
             llm.generate_kwargs.pop("max_output_tokens", None)
             llm.generate_kwargs.pop("max_length", None)
     except Exception:
-        pass
+        generate_kwargs_snapshot = None
+
+    additional_kwargs_snapshot = None
+    try:
+        if hasattr(llm, "additional_kwargs") and isinstance(llm.additional_kwargs, dict):
+            additional_kwargs_snapshot = llm.additional_kwargs.copy()
+            llm.additional_kwargs.pop("max_tokens", None)
+            llm.additional_kwargs.pop("max_new_tokens", None)
+            llm.additional_kwargs.pop("max_output_tokens", None)
+            llm.additional_kwargs.pop("max_completion_tokens", None)
+    except Exception:
+        additional_kwargs_snapshot = None
 
     # Best-effort: set wrapper caps; restore in finally
     prev_max_tokens = getattr(llm, "max_tokens", None) if hasattr(llm, "max_tokens") else None
@@ -1423,6 +1605,47 @@ def generate(
             budget_key = "max_new_tokens"
         else:
             budget_key = "max_tokens"
+
+        out_cap = int(target)
+        per_call_kwargs: dict[str, Any] = {}
+        if budget_key:
+            per_call_kwargs[budget_key] = out_cap
+        # Provide common aliases so providers honor the largest cap available.
+        per_call_kwargs.setdefault("max_tokens", out_cap)
+        per_call_kwargs.setdefault("max_new_tokens", out_cap)
+        per_call_kwargs.setdefault("max_output_tokens", out_cap)
+        per_call_kwargs.setdefault("max_completion_tokens", out_cap)
+
+        forward_kwargs = {
+            k: v
+            for k, v in kwargs.items()
+            if k not in {"model", "engine", "max_new_tokens"}
+        }
+
+        def _invoke_with_budget(func: Callable[..., Any], *call_args: Any) -> Any:
+            trial_kwargs = {**per_call_kwargs}
+            fallback_order = [
+                "max_completion_tokens",
+                "max_output_tokens",
+                "max_tokens",
+                "max_new_tokens",
+            ]
+            while True:
+                try:
+                    return func(*call_args, **trial_kwargs, **forward_kwargs)
+                except TypeError as exc:
+                    msg = str(exc)
+                    removed = False
+                    for key in list(trial_kwargs.keys()):
+                        if f"'{key}'" in msg or f"{key}" in msg:
+                            trial_kwargs.pop(key, None)
+                            removed = True
+                    if not removed:
+                        if not fallback_order:
+                            raise
+                        trial_kwargs.pop(fallback_order.pop(0), None)
+                    if not trial_kwargs:
+                        return func(*call_args, **forward_kwargs)
 
         # Build prompt and chat messages
         user_query = query or ""
@@ -1453,9 +1676,28 @@ def generate(
         except Exception:
             pass
 
+        # Estimate prompt tokens for context-window guard
+        prompt_token_count = 0
+        try:
+            enc = tiktoken.get_encoding("cl100k_base")
+            prompt_token_count = len(enc.encode(full_prompt))
+        except Exception:
+            prompt_token_count = len(full_prompt.split())
+
+        ctx_prev = None
+        try:
+            ctx_prev = getattr(llm, "context_window", None)
+            if isinstance(ctx_prev, int) and ctx_prev > 0:
+                buffer_tokens = 128
+                required = prompt_token_count + target + buffer_tokens
+                if required > ctx_prev:
+                    setattr(llm, "context_window", required)
+        except Exception:
+            ctx_prev = None
+
         start_time = time.time()
         if use_chat and callable(getattr(llm, "chat", None)):
-            resp = llm.chat(chat)
+            resp = _invoke_with_budget(llm.chat, chat)
             text_out = ""
             if hasattr(resp, "message") and getattr(resp, "message") is not None:
                 msg = getattr(resp, "message")
@@ -1468,16 +1710,10 @@ def generate(
 
             if not (text_out or "").strip() and callable(getattr(llm, "complete", None)):
                 logger.warning("Empty chat response—falling back to complete.")
-                try:
-                    r2 = llm.complete(full_prompt, **{budget_key: target})
-                except TypeError:
-                    r2 = llm.complete(full_prompt)
+                r2 = _invoke_with_budget(llm.complete, full_prompt)
                 text_out = r2.text if hasattr(r2, "text") else str(r2)
         elif callable(getattr(llm, "complete", None)):
-            try:
-                resp = llm.complete(full_prompt, **{budget_key: target})
-            except TypeError:
-                resp = llm.complete(full_prompt)
+            resp = _invoke_with_budget(llm.complete, full_prompt)
             text_out = resp.text if hasattr(resp, "text") else str(resp)
         else:
             return "LLM BACKEND UNSUPPORTED FOR GENERATION."
@@ -1488,6 +1724,22 @@ def generate(
                 "Empty response from model—check query, provider limits, or model compatibility."
             )
             return "Empty response from model."
+
+        # Inspect provider finish reason when available
+        finish_reason = None
+        raw_obj = locals().get("r2") if "r2" in locals() else None
+        if raw_obj is None:
+            raw_obj = locals().get("resp") if "resp" in locals() else None
+        if raw_obj is not None:
+            raw_payload = getattr(raw_obj, "raw", None)
+            if isinstance(raw_payload, dict):
+                finish_reason = raw_payload.get("finish_reason")
+                if finish_reason is None:
+                    choices = raw_payload.get("choices")
+                    if isinstance(choices, list) and choices:
+                        finish_reason = choices[0].get("finish_reason")
+        if finish_reason == "length":
+            logger.warning("Provider truncated response (finish_reason=length).")
 
         # Metrics (lightweight)
         try:
@@ -1550,6 +1802,23 @@ def generate(
         try:
             if prev_max_tokens is not None and hasattr(llm, "max_tokens"):
                 setattr(llm, "max_tokens", prev_max_tokens)
+        except Exception:
+            pass
+        if generate_kwargs_snapshot is not None:
+            try:
+                llm.generate_kwargs.clear()
+                llm.generate_kwargs.update(generate_kwargs_snapshot)
+            except Exception:
+                pass
+        if additional_kwargs_snapshot is not None:
+            try:
+                llm.additional_kwargs.clear()
+                llm.additional_kwargs.update(additional_kwargs_snapshot)
+            except Exception:
+                pass
+        try:
+            if ctx_prev is not None and hasattr(llm, "context_window"):
+                setattr(llm, "context_window", ctx_prev)
         except Exception:
             pass
 

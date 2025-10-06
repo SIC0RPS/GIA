@@ -195,13 +195,17 @@ class ColoredFormatter(logging.Formatter):
             exc_text = self.formatException(record.exc_info)
             exc_text = _anonymize_path(exc_text)
             msg += f"\n{exc_text}"
-        max_length = {
-            logging.DEBUG: 5000 if CONFIG["DEBUG"] else 1000,
-            logging.INFO: 1000,
-            logging.WARNING: float("inf") if CONFIG["DEBUG"] else 1000,
-            logging.ERROR: float("inf"),
-            logging.CRITICAL: float("inf"),
-        }.get(record.levelno, 500)
+        debug_mode = CONFIG.get("DEBUG", False)
+        if debug_mode:
+            max_length = float("inf")
+        else:
+            max_length = {
+                logging.DEBUG: 1000,
+                logging.INFO: 1000,
+                logging.WARNING: 1000,
+                logging.ERROR: float("inf"),
+                logging.CRITICAL: float("inf"),
+            }.get(record.levelno, 500)
         if max_length != float("inf") and len(msg) > max_length:
             msg = msg[: max_length - 3] + "..."
 
@@ -217,7 +221,7 @@ class ColoredFormatter(logging.Formatter):
 
 
 class PlainFormatter(logging.Formatter):
-    """Format log messages without colors, with dynamic length truncation."""
+    """Format log messages without colors; disables truncation when DEBUG is enabled."""
 
     def format(self, record: logging.LogRecord) -> str:
         func_display = record.funcName if record.funcName != "" else record.name
@@ -229,13 +233,16 @@ class PlainFormatter(logging.Formatter):
             exc_text = self.formatException(record.exc_info)
             exc_text = _anonymize_path(exc_text)
             msg += f"\n{exc_text}"
-        max_length = {
-            logging.DEBUG: 5000 if CONFIG["DEBUG"] else 1000,
-            logging.INFO: 1000,
-            logging.WARNING: float("inf") if CONFIG["DEBUG"] else 1000,
-            logging.ERROR: float("inf"),
-            logging.CRITICAL: float("inf"),
-        }.get(record.levelno, 1000)
+        if CONFIG.get("DEBUG", False):
+            max_length = float("inf")
+        else:
+            max_length = {
+                logging.DEBUG: 1000,
+                logging.INFO: 1000,
+                logging.WARNING: 1000,
+                logging.ERROR: float("inf"),
+                logging.CRITICAL: float("inf"),
+            }.get(record.levelno, 1000)
         if max_length != float("inf") and len(msg) > max_length:
             msg = msg[: max_length - 3] + "..."
         return f"[{asctime}|{record.levelname}|{func_display}|{msg}]"
@@ -368,6 +375,7 @@ viewer_code = textwrap.dedent(
     import time
     import os
     import atexit
+    import platform
     try:
         from rich.console import Console
         from rich.text import Text
@@ -375,7 +383,8 @@ viewer_code = textwrap.dedent(
         print("Rich is required for the debug log viewer. `pip install rich`")
         sys.exit(1)
 
-    console = Console(force_terminal=True)
+    force_on = platform.system() != "Windows"
+    console = Console(force_terminal=force_on)
 
     def _render(asctime: str, level: str, func: str, msg: str):
         # Rehydrate escaped newlines

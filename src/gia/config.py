@@ -15,6 +15,7 @@ DEFAULTS: Dict[str, Any] = {
     "REPETITION_PENALTY": 1.1,
     "NO_REPEAT_NGRAM_SIZE": 4,
     "DEBUG": True,
+    "PLUGIN_IDLE_TIMEOUT_SECONDS": 0,
     "MODEL_PATH": "~/models/quantized",
     "EMBED_MODEL_PATH": "~/models/bge-large-en-v1.5",
     "DATA_PATH": "MyData",
@@ -162,6 +163,10 @@ CONFIG["MODEL_TYPE"] = model_defaults.get("model_type", None)
 
 # ----- GENERAL / PROMPTS -----
 CONFIG["DEBUG"] = config_dict.get("general", {}).get("debug", DEFAULTS["DEBUG"])
+CONFIG["PLUGIN_IDLE_TIMEOUT_SECONDS"] = config_dict.get("general", {}).get(
+    "plugin_idle_timeout_seconds",
+    DEFAULTS["PLUGIN_IDLE_TIMEOUT_SECONDS"],
+)
 
 qa_prompt_data = config_dict.get("prompt", {}).get("qa_prompt", DEFAULTS["QA_PROMPT"])
 if isinstance(qa_prompt_data, str):
