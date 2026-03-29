@@ -20,7 +20,6 @@ import torch
 import gradio as gr
 import chromadb
 from transformers import TextIteratorStreamer
-from functools import partial
 from datetime import datetime
 from rich.console import Console
 from rich.markdown import Markdown
@@ -44,6 +43,7 @@ from gia.core.utils import (
     unload_model,
     load_llm,
     fetch_openai_models,
+    generate,
 )
 
 init(autoreset=True)
@@ -475,20 +475,25 @@ def format_json_for_chat(item: Any) -> str:
         return str(item)
 
 
-def load_plugins() -> Dict[str, Callable]:
+def load_plugins(force: bool = False) -> Dict[str, Callable]:
     """Load plugins from plugins/ directory for dynamic extensibility.
 
     Returns:
         Dict[str, callable]: Dictionary of plugin functions.
     """
-    global plugins
-    plugins = {}
+    global plugins, module_mtimes
+    new_plugins: Dict[str, Callable] = {}
     if not plugins_dir_path.is_dir():
         logger.warning(f"Plugins directory not found: {plugins_dir_path}")
+        plugins = {}
+        module_mtimes.clear()
         return plugins
 
+    importlib.invalidate_caches()
+    discovered_modules = set()
+
     # TO SCAN DIRECT SUBDIRECTORIES ONLY
-    for subdir in os.listdir(plugins_dir_path):
+    for subdir in sorted(os.listdir(plugins_dir_path)):
         subdir_path = plugins_dir_path / subdir
         if not subdir_path.is_dir():
             continue
@@ -500,21 +505,97 @@ def load_plugins() -> Dict[str, Callable]:
 
         # TO IMPORT SUBMODULE
         module_name = f"gia.plugins.{subdir}.{subdir}"
+        discovered_modules.add(module_name)
         try:
-            module = importlib.import_module(module_name)
+            mtime = plugin_path.stat().st_mtime
+        except OSError as exc:
+            logger.error(f"Failed to stat plugin file {plugin_path}: {exc}")
+            continue
+        try:
+            module = sys.modules.get(module_name)
+            reload_required = (
+                force
+                or module is None
+                or module_mtimes.get(module_name) != mtime
+            )
+            if module is not None and reload_required:
+                module = importlib.reload(module)
+                logger.debug(f"Reloaded plugin module: {module_name}")
+            elif module is None:
+                module = importlib.import_module(module_name)
+                logger.debug(f"Imported plugin module: {module_name}")
+            module_mtimes[module_name] = mtime
             # TO COLLECT ONLY MATCHING LOCAL FUNCTION
             if subdir in dir(module):
                 attr = getattr(module, subdir)
                 if inspect.isfunction(attr) and attr.__module__ == module.__name__:
-                    plugins[subdir] = attr
+                    new_plugins[subdir] = attr
                     logger.debug(f"Loaded plugin function: {subdir} from {module_name}")
         except ImportError as e:
             logger.error(f"Failed to load plugin {module_name}: {e}")
         except Exception as e:
             logger.error(f"Error processing plugin {module_name}: {e}")
 
+    # Remove stale modules (deleted from disk)
+    stale = set(module_mtimes.keys()) - discovered_modules
+    for module in stale:
+        module_mtimes.pop(module, None)
+        sys.modules.pop(module, None)
+
+    plugins = new_plugins
     logger.info(f"(L.P) Loaded {len(plugins)} plugins: {list(plugins.keys())}")
     return plugins
+
+
+def reload_plugins() -> Dict[str, Callable]:
+    """Force reload all plugins from disk."""
+    return load_plugins(force=True)
+
+
+def reload_plugin(plugin_name: str) -> Tuple[bool, str]:
+    """Reload a single plugin by name."""
+    name = (plugin_name or "").strip().lower()
+    if not name:
+        return False, "Error: Plugin name required."
+
+    plugin_dir = plugins_dir_path / name
+    plugin_file = plugin_dir / f"{name}.py"
+    if not plugin_file.is_file():
+        return False, f"Error: Plugin '{name}' not found."
+
+    module_name = f"gia.plugins.{name}.{name}"
+    module_prefix = f"gia.plugins.{name}"
+
+    importlib.invalidate_caches()
+    try:
+        mtime = plugin_file.stat().st_mtime
+    except OSError as exc:
+        return False, f"Error accessing plugin '{name}': {exc}"
+
+    existing_callable = plugins.get(name)
+
+    try:
+        # Drop cached modules for a clean import of this plugin
+        for key in list(sys.modules.keys()):
+            if key == module_prefix or key.startswith(f"{module_prefix}.") or key == module_name:
+                sys.modules.pop(key, None)
+
+        module = importlib.import_module(module_name)
+        module_mtimes[module_name] = mtime
+        attr = getattr(module, name, None)
+        if not (inspect.isfunction(attr) and attr.__module__ == module.__name__):
+            raise AttributeError(f"No callable '{name}' found in module.")
+        plugins[name] = attr
+        logger.info("Plugin '%s' reloaded.", name)
+        return True, f"Plugin '{name}' reloaded."
+    except Exception as exc:
+        logger.error("Reload plugin '%s' failed: %s", name, exc)
+        if existing_callable is not None:
+            plugins[name] = existing_callable
+        else:
+            plugins.pop(name, None)
+        module_mtimes.pop(module_name, None)
+        return False, f"Error reloading plugin '{name}': {exc}"
 
 
 plugins = load_plugins()
@@ -571,17 +652,33 @@ def handle_command(
 
     if not isinstance(chat_history, list):
         raise ValueError("chat_history must be a list[dict].")
-    if not isinstance(cmd, str) or not cmd.strip():
+    if not isinstance(cmd, str):
         return "Error: Empty command."
 
-    cmd_lower = cmd.strip().lower()
-    llm_free = {".load", ".create", ".info", ".delete", ".unload"}
+    raw_cmd = cmd.strip()
+    if not raw_cmd:
+        return "Error: Empty command."
+
+    try:
+        parts = shlex.split(raw_cmd)
+    except ValueError as e:
+        return f"Error parsing command: {e}"
+    if not parts:
+        return "Error: Empty command."
+
+    cmd_token = parts[0]
+    cmd_lower = cmd_token.lower()
+    optional_arg = parts[1] if len(parts) > 1 else None
+
+    llm_free = {".load", ".create", ".info", ".delete", ".unload", ".reload"}
     if app_state.LLM is None and cmd_lower not in llm_free:
         return "Error: No model loaded. Please confirm a model first."
 
     if cmd_lower in llm_free:
         try:
             if cmd_lower == ".create":
+                if optional_arg:
+                    return "Error: '.create' does not accept arguments."
                 save_database()
                 state_dict["use_query_engine_gr"] = True
                 state_dict["database_loaded_gr"] = True
@@ -589,9 +686,13 @@ def handle_command(
                 return "Database created. Query engine re-enabled."
 
             if cmd_lower == ".load":
+                if optional_arg:
+                    return "Error: '.load' does not accept arguments."
                 return load_database_wrapper(state_dict)
 
             if cmd_lower == ".info":
+                if optional_arg:
+                    return "Error: '.info' does not accept arguments."
                 cpu, mem, gpus = get_system_info()
                 model_name = app_state.MODEL_NAME or "None"
                 db_loaded = bool(app_state.DATABASE_LOADED)
@@ -606,6 +707,8 @@ def handle_command(
                 )
 
             if cmd_lower == ".delete":
+                if optional_arg:
+                    return "Error: '.delete' does not accept arguments."
                 db_path = Path(DB_PATH)
                 if not db_path.exists():
                     state_dict["status_gr"] = "No database to delete"
@@ -638,30 +741,47 @@ def handle_command(
                     return f"Error deleting database: {e}"
 
             if cmd_lower == ".unload":
+                if optional_arg:
+                    return "Error: '.unload' does not accept arguments."
                 msg = unload_model()
                 state_dict["status_gr"] = (
                     "Model unloaded" if "success" in msg.lower() else "Unload attempted"
                 )
                 return msg
+            if cmd_lower == ".reload":
+                if len(parts) > 2:
+                    return "Error: '.reload' accepts at most one argument."
+                if optional_arg:
+                    success, message = reload_plugin(optional_arg)
+                    state_dict["status_gr"] = "Plugin reloaded" if success else "Plugin reload failed"
+                    return message
+                before = set(plugins.keys())
+                reload_plugins()
+                after = set(plugins.keys())
+                added = sorted(after - before)
+                removed = sorted(before - after)
+                if added or removed:
+                    summary = []
+                    if added:
+                        summary.append(f"Added: {', '.join(added)}.")
+                    if removed:
+                        summary.append(f"Removed: {', '.join(removed)}.")
+                    message = " ".join(["Reloaded plugins."] + summary)
+                else:
+                    message = f"Reloaded {len(after)} plugin(s)."
+                state_dict["status_gr"] = "Plugins reloaded"
+                return message
 
         except Exception as e:
             logger.error("Built-in command failed: %s", e)
             return f"Command failed: {e}"
 
-    if not cmd_lower.startswith(".") or len(cmd_lower) <= 1:
+    if not cmd_token.startswith(".") or len(cmd_token) <= 1:
         return "Error: Invalid command. Commands must start with '.'"
-
-    try:
-        parts = shlex.split(cmd)
-    except ValueError as e:
-        return f"Error parsing command: {e}"
-
-    if not parts or not parts[0].startswith("."):
-        return "Error: Invalid plugin syntax."
     if len(parts) > 2:
         return "Error: Plugin command accepts at most one argument."
 
-    plugin_name = parts[0][1:].lower()
+    plugin_name = cmd_token[1:].lower()
     optional_arg = parts[1] if len(parts) == 2 else None
 
     if plugin_name not in plugins:
@@ -1109,6 +1229,156 @@ def update_model_dropdown(directory: str) -> Tuple[Any, List[Dict[str, str]]]:
     ]
 
 
+def _resolve_model_config(
+    mode: str,
+    *,
+    state: Optional[Dict[str, Any]] = None,
+    model: Optional[str] = None,
+) -> Tuple[Dict[str, Any], str]:
+    """Normalize a model selection into the config expected by load_llm()."""
+    state_dict = state if isinstance(state, dict) else {}
+    app_state = load_state()
+
+    if mode == "Local":
+        selected = model or state_dict.get("model_path_gr") or app_state.MODEL_PATH or CONFIG["MODEL_PATH"]
+        resolved_path: Optional[str] = None
+        try:
+            mapping = state_manager.get_state("LOCAL_MODELS_MAP", {}) or {}
+            if isinstance(mapping, dict) and isinstance(selected, str) and selected in mapping:
+                resolved_path = mapping[selected]
+        except Exception as e:
+            logger.debug(f"LOCAL_MODELS_MAP resolution failed: {e}")
+
+        if resolved_path is None and isinstance(selected, str) and selected.strip():
+            resolved_path = os.path.expanduser(selected.strip())
+        if not resolved_path:
+            raise ValueError("No valid local model directory resolved.")
+        if not os.path.isdir(resolved_path):
+            raise ValueError(f"No valid local model directory resolved: {resolved_path}")
+        return {"model_path": resolved_path}, os.path.basename(os.path.normpath(resolved_path))
+
+    if mode == "HuggingFace":
+        model_name = (
+            model
+            or state_dict.get("hf_model_name")
+            or "mistralai/Mistral-7B-Instruct-v0.2"
+        )
+        return {"model_name": model_name}, str(model_name)
+
+    if mode == "OpenAI":
+        model_name = model or state_dict.get("openai_model_name") or "gpt-4o"
+        return {"model_name": model_name}, str(model_name)
+
+    if mode == "OpenRouter":
+        model_name = model or state_dict.get("openrouter_model_name") or "x-ai/grok-4-fast"
+        return {"model_name": model_name}, str(model_name)
+
+    raise ValueError(f"Invalid mode: {mode}")
+
+
+def _initialize_selected_model(
+    mode: str,
+    *,
+    state: Optional[Dict[str, Any]] = None,
+    model: Optional[str] = None,
+    unload_existing: bool = False,
+) -> Tuple[Dict[str, Any], str]:
+    """Load the selected model and update shared runtime state."""
+    if unload_existing:
+        try:
+            unload_model()
+            logger.info("Previous model unloaded successfully")
+        except Exception as e:
+            logger.warning(f"Unload previous model failed: {str(e)}. Proceeding with load.")
+
+    config, display_name = _resolve_model_config(mode, state=state, model=model)
+    logger.info(
+        "(LOAD) Loading model for mode=%s; target=%s",
+        mode,
+        config.get("model_path") or config.get("model_name"),
+    )
+    msg, llm = load_llm(mode, config)
+    if llm is None:
+        raise RuntimeError(msg)
+
+    state_manager.set_state("MODE", mode)
+    state_manager.set_state("LLM", llm)
+    state_manager.set_state("MODEL_NAME", display_name)
+    state_manager.set_state("MODEL_PATH", config.get("model_path") if mode == "Local" else None)
+    logger.info("Loaded LLM type: %s for mode %s", type(llm).__name__, mode)
+    return config, display_name
+
+
+def _build_model_status_header(mode: str, display_name: str) -> str:
+    """Create the UI status header after a successful model load."""
+    proj_name, proj_ver = "GIA", "0.0.0"
+    try:
+        py_path = PROJECT_ROOT.parent.parent / "pyproject.toml"
+        if py_path.exists():
+            with py_path.open("rb") as f:
+                data = tomllib.load(f)
+            if isinstance(data, dict):
+                proj = data.get("project", {}) or {}
+                if isinstance(proj, dict):
+                    proj_name = str(proj.get("name", proj_name))
+                    proj_ver = str(proj.get("version", proj_ver))
+    except Exception as e:
+        logger.debug(f"pyproject read failed: {e}")
+
+    cpu_name = "Unknown CPU"
+    try:
+        cpuinfo_path = "/proc/cpuinfo"
+        if os.path.exists(cpuinfo_path):
+            with open(cpuinfo_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if line.lower().startswith("model name"):
+                        parts = line.split(":", 1)
+                        if len(parts) == 2:
+                            cpu_name = parts[1].strip()
+                            break
+        if cpu_name == "Unknown CPU":
+            import platform
+
+            cpu_name = platform.processor() or cpu_name
+    except Exception as e:
+        logger.debug(f"CPU name detection failed: {e}")
+
+    gpu_name: Optional[str] = None
+    try:
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+    except Exception as e:
+        logger.debug(f"GPU name detection failed: {e}")
+
+    if mode == "Local":
+        loaded_on = f"Loaded on: GPU: {gpu_name}" if gpu_name else f"Loaded on: CPU: {cpu_name}"
+        status_header = f"### {proj_name} v.{proj_ver} - Local model: {display_name} - {loaded_on}"
+    else:
+        status_header = f"### {proj_name} v.{proj_ver} - {mode} model: {display_name}"
+
+    active_collection: Optional[str] = None
+    try:
+        active_collection = state_manager.get_state("COLLECTION_NAME") or None
+    except Exception:
+        active_collection = None
+    if active_collection is None:
+        try:
+            client = _ensure_client()
+            cols = client.list_collections()
+            if cols:
+                c0 = cols[0]
+                active_collection = getattr(c0, "name", None) or (
+                    c0.get("name") if isinstance(c0, dict) else None
+                )
+        except Exception:
+            active_collection = None
+
+    return (
+        status_header
+        + f"\n\n#### Database Config\n- Base path: `{DB_PATH}`\n- Collection: `{active_collection or 'none'}`"
+    )
+
+
 def finalize_model_selection(
     mode: str,
     state: Dict,
@@ -1122,136 +1392,20 @@ def finalize_model_selection(
     Returns:
         Tuple[str, Dict]: Status message (Markdown) and updated state.
     """
-    try:
-        unload_model()
-        logger.info("Previous model unloaded successfully")
-    except Exception as e:
-        logger.warning(f"Unload previous model failed: {str(e)}. Proceeding with load.")
-
     if not isinstance(state, dict):
         logger.error("Invalid state: expected dictionary")
         state = {}
         return "Error: Invalid state provided", state
 
-    state_manager.set_state("MODE", mode)
-    logger.info(f"Model mode set to {mode} globally")
-
-    config: Dict[str, Any] = {}
-    if mode == "Local":
-        selected = state.get("model_path_gr", "") or CONFIG["MODEL_PATH"]
-        resolved_path: Optional[str] = None
-        try:
-            mapping = state_manager.get_state("LOCAL_MODELS_MAP", {}) or {}
-            if isinstance(mapping, dict) and selected in mapping:
-                resolved_path = mapping[selected]
-        except Exception as e:
-            logger.debug(f"(UI) LOCAL_MODELS_MAP resolution failed: {e}")
-        config["model_path"] = resolved_path or selected
-    elif mode == "HuggingFace":
-        config["model_name"] = state.get(
-            "hf_model_name", "mistralai/Mistral-7B-Instruct-v0.2"
-        )
-    elif mode == "OpenAI":
-        config["model_name"] = state.get("openai_model_name", "gpt-4o")
-    elif mode == "OpenRouter":
-        config["model_name"] = state.get("openrouter_model_name", "x-ai/grok-4-fast")
-    else:
-        error_msg = f"Invalid mode: {mode}"
-        logger.error(error_msg)
-        state["status_gr"] = error_msg
-        return error_msg, state
-
     try:
-        msg, llm = load_llm(mode, config)
-        if not llm:
-            raise RuntimeError(msg)
-
-        state_manager.set_state("LLM", llm)
-        raw_name = config.get("model_name", config.get("model_path", "Unknown Model"))
-        display_name = (
-            os.path.basename(os.path.normpath(raw_name)) if mode == "Local" else str(raw_name)
+        _, display_name = _initialize_selected_model(
+            mode,
+            state=state,
+            unload_existing=True,
         )
-        state_manager.set_state("MODEL_NAME", display_name)
-        state_manager.set_state("MODEL_PATH", config.get("model_path", ""))
-
-        # Project name/version for header
-        proj_name, proj_ver = "GIA", "0.0.0"
-        try:
-            import tomllib  # Python 3.11+ stdlib
-            py_path = PROJECT_ROOT.parent.parent / "pyproject.toml"
-            if py_path.exists():
-                with py_path.open("rb") as f:
-                    data = tomllib.load(f)
-                if isinstance(data, dict):
-                    proj = data.get("project", {}) or {}
-                    if isinstance(proj, dict):
-                        proj_name = str(proj.get("name", proj_name))
-                        proj_ver = str(proj.get("version", proj_ver))
-        except Exception as e:
-            logger.debug(f"pyproject read failed: {e}")
-
-        # Hardware detection: show either GPU or CPU (never both)
-        cpu_name = "Unknown CPU"
-        try:
-            cpuinfo_path = "/proc/cpuinfo"
-            if os.path.exists(cpuinfo_path):
-                with open(cpuinfo_path, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        if line.lower().startswith("model name"):
-                            parts = line.split(":", 1)
-                            if len(parts) == 2:
-                                cpu_name = parts[1].strip()
-                                break
-            if cpu_name == "Unknown CPU":
-                import platform
-                cpu_name = platform.processor() or cpu_name
-        except Exception as e:
-            logger.debug(f"CPU name detection failed: {e}")
-
-        gpu_name: Optional[str] = None
-        try:
-            if torch.cuda.is_available():
-                gpu_name = torch.cuda.get_device_name(0)
-        except Exception as e:
-            logger.debug(f"GPU name detection failed: {e}")
-
-        # Status header as Markdown H3
-        if mode == "Local":
-            loaded_on = f"Loaded on: GPU: {gpu_name}" if gpu_name else f"Loaded on: CPU: {cpu_name}"
-            status_header = f"### {proj_name} v.{proj_ver} - Local model: {display_name} - {loaded_on}"
-        else:
-            # Online providers: concise header; hardware not applicable
-            status_header = f"### {proj_name} v.{proj_ver} - {mode} model: {display_name}"
-
-        # Database Config — reflect live active collection (not config)
-        active_collection: Optional[str] = None
-        try:
-            active_collection = state_manager.get_state("COLLECTION_NAME") or None
-        except Exception:
-            active_collection = None
-        if active_collection is None:
-            # Fallback: show first available collection if none selected yet
-            try:
-                client = _ensure_client()
-                cols = client.list_collections()
-                if cols:
-                    c0 = cols[0]
-                    active_collection = getattr(c0, "name", None) or (
-                        c0.get("name") if isinstance(c0, dict) else None
-                    )
-            except Exception:
-                active_collection = None
-
-        db_md = (
-            f"\n\n#### Database Config\n"
-            f"- Base path: `{DB_PATH}`\n"
-            f"- Collection: `{active_collection or 'none'}`"
-        )
-        status_header += db_md
-
+        status_header = _build_model_status_header(mode, display_name)
         state["status_gr"] = status_header
         state["model_loaded_gr"] = True
-        logger.info(f"Loaded LLM type: {type(llm).__name__} for mode {mode}")
         return status_header, state
 
     except Exception as e:
@@ -1288,6 +1442,122 @@ def db_load_handler(
     except Exception as e:
         logger.error(f"db_load_handler failed: {e}")
         return chat_history or [], (state or {}), f"Error: {e}"
+
+
+def _cli_db_state(mode: str) -> Dict[str, Any]:
+    """Build the minimal state dict required for DB loading in CLI mode."""
+    return {
+        "cli_mode": True,
+        "mode": mode,
+        "use_query_engine_gr": True,
+        "status_gr": "",
+        "database_loaded_gr": False,
+    }
+
+
+def _resolve_cli_prompt(args: argparse.Namespace) -> str:
+    """Resolve one-shot CLI prompt from args or stdin."""
+    prompt = (getattr(args, "prompt", None) or "").strip()
+    if prompt:
+        return prompt
+    if not getattr(args, "run", False):
+        raise ValueError("No prompt provided. Use --prompt or provide stdin with --run.")
+
+    stdin_text = getattr(args, "stdin_prompt", None)
+    if stdin_text is None:
+        stdin_text = sys.stdin.read()
+    prompt = stdin_text.strip()
+    if not prompt:
+        raise ValueError("No prompt provided on stdin.")
+    return prompt
+
+
+def _parse_cli_scalar(value: str) -> Any:
+    """Best-effort parse for CLI passthrough kwargs."""
+    text = str(value).strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    if lowered in {"none", "null"}:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        return text
+
+
+def _collect_cli_generate_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
+    """Collect one-shot CLI generation overrides for generate()."""
+    gen_kwargs: Dict[str, Any] = {}
+    if getattr(args, "temperature", None) is not None:
+        gen_kwargs["temperature"] = float(args.temperature)
+    if getattr(args, "top_p", None) is not None:
+        gen_kwargs["top_p"] = float(args.top_p)
+    if getattr(args, "top_k", None) is not None:
+        gen_kwargs["top_k"] = int(args.top_k)
+    if getattr(args, "repetition_penalty", None) is not None:
+        gen_kwargs["repetition_penalty"] = float(args.repetition_penalty)
+    if getattr(args, "no_repeat_ngram_size", None) is not None:
+        gen_kwargs["no_repeat_ngram_size"] = int(args.no_repeat_ngram_size)
+
+    for raw_item in getattr(args, "gen_arg", []) or []:
+        item = str(raw_item or "").strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(
+                f"Invalid --gen-arg '{item}'. Expected KEY=VALUE format."
+            )
+        key, raw_value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(
+                f"Invalid --gen-arg '{item}'. Key cannot be empty."
+            )
+        gen_kwargs[key] = _parse_cli_scalar(raw_value)
+    return gen_kwargs
+
+
+def run_cli_once(args: argparse.Namespace) -> int:
+    """Run a single non-streaming CLI prompt and exit."""
+    try:
+        prompt = _resolve_cli_prompt(args)
+        _initialize_selected_model(
+            args.mode,
+            model=args.model,
+            unload_existing=load_state().LLM is not None,
+        )
+        if getattr(args, "load_db", False):
+            db_result = load_database_wrapper(_cli_db_state(args.mode))
+            if str(db_result).strip().lower().startswith("error"):
+                print(str(db_result).strip())
+                return 1
+
+        system_prompt = (
+            getattr(args, "system_prompt", None)
+            if getattr(args, "system_prompt", None) is not None
+            else system_prefix()
+        )
+        llm = load_state().LLM
+        if llm is None:
+            print("Error: No model loaded.")
+            return 1
+
+        response = generate(
+            query=prompt,
+            system_prompt=system_prompt,
+            llm=llm,
+            max_new_tokens=getattr(args, "max_new_tokens", None),
+            think=bool(getattr(args, "think", False)),
+            **_collect_cli_generate_kwargs(args),
+        )
+        print(response)
+        return 0
+    except Exception as e:
+        print(f"Error: {e}")
+        return 1
 
 
 def chat_fn(
@@ -1349,78 +1619,18 @@ def handle_load_button(
         return chat_history, state_dict
 
     mode = str(state_dict.get("mode", "Local"))
-    model_path_gr = state_dict.get("model_path_gr")
 
     try:
         if app_state.LLM is None:
-            config: Dict[str, Any] = {}
-            display_name: Optional[str] = None
-
-            if mode == "Local":
-                resolved_path: Optional[str] = None
-                mapping: Dict[str, str] = {}
-                try:
-                    mapping = state_manager.get_state("LOCAL_MODELS_MAP", {}) or {}
-                except Exception:
-                    mapping = {}
-
-                if isinstance(model_path_gr, str) and model_path_gr in mapping:
-                    resolved_path = mapping[model_path_gr]
-                elif isinstance(app_state.MODEL_PATH, str) and app_state.MODEL_PATH:
-                    resolved_path = app_state.MODEL_PATH
-                elif isinstance(model_path_gr, str) and model_path_gr:
-                    resolved_path = model_path_gr
-
-                if not resolved_path or not os.path.isdir(resolved_path):
-                    raise ValueError(
-                        "No valid local model directory resolved. "
-                        "Use 'Scan Directory' and 'Confirm Model' first."
-                    )
-
-                config = {"model_path": resolved_path}
-                display_name = os.path.basename(os.path.normpath(resolved_path))
-
-            elif mode == "HuggingFace":
-                mn = (
-                    state_dict.get("hf_model_name")
-                    or "mistralai/Mistral-7B-Instruct-v0.2"
-                )
-                config = {"model_name": mn}
-                display_name = str(mn)
-
-            elif mode == "OpenAI":
-                mn = state_dict.get("openai_model_name") or "gpt-4o"
-                config = {"model_name": mn}
-                display_name = str(mn)
-
-            elif mode == "OpenRouter":
-                mn = state_dict.get("openrouter_model_name") or "x-ai/grok-4-fast"
-                config = {"model_name": mn}
-                display_name = str(mn)
-
-            else:
-                raise ValueError(f"Invalid mode: {mode}")
-
-            logger.info(
-                "(LOAD) Loading model for mode=%s; target=%s",
-                mode,
-                config.get("model_path") or config.get("model_name"),
-            )
-            msg, llm = load_llm(mode, config)
-            if llm is None:
+            try:
+                _initialize_selected_model(mode, state=state_dict, unload_existing=False)
+            except Exception as e:
                 append_to_chatbot(
                     chat_history,
-                    f"Error: Failed to load model: {msg}",
+                    f"Error: Failed to load model: {e}",
                     metadata={"role": "assistant"},
                 )
                 return chat_history, state_dict
-
-            state_manager.set_state("LLM", llm)
-            state_manager.set_state("MODEL_NAME", display_name)
-            if mode == "Local":
-                state_manager.set_state("MODEL_PATH", config["model_path"])
-            else:
-                state_manager.set_state("MODEL_PATH", None)
 
         result = load_database_wrapper(state_dict)
         message = str(result).strip()
@@ -1443,6 +1653,24 @@ def handle_load_button(
 
 def launch_app(args: argparse.Namespace) -> None:
     """Launch Gradio application with fixed sidebars and full‑width chat."""
+    wants_one_shot = bool(getattr(args, "prompt", None) is not None) or bool(
+        getattr(args, "run", False)
+    )
+    if wants_one_shot:
+        raise SystemExit(run_cli_once(args))
+
+    if getattr(args, "mode", None) and getattr(args, "model", None):
+        _initialize_selected_model(
+            args.mode,
+            model=args.model,
+            unload_existing=load_state().LLM is not None,
+        )
+        if getattr(args, "load_db", False):
+            db_result = load_database_wrapper(_cli_db_state(args.mode))
+            if str(db_result).strip().lower().startswith("error"):
+                raise RuntimeError(str(db_result).strip())
+            logger.info(db_result)
+
     launch_event = threading.Event()
 
     def threaded_launch() -> None:
@@ -1519,6 +1747,30 @@ def launch_app(args: argparse.Namespace) -> None:
             [data-testid="chatbot"], [data-testid="chatbot"] * { color:#fff !important; }
             .message.bot, .bubble.bot   { background:#121212 !important; border:none !important; }
             .message.user, .bubble.user { background:#141414 !important; border:none !important; }
+
+            /* Plugin list buttons */
+            .plugin-row { align-items:center !important; gap:8px !important; }
+            .plugin-row > *:first-child { flex:1 1 auto !important; }
+            .plugin-reload-btn button {
+                width:36px !important;
+                height:36px !important;
+                padding:0 !important;
+                display:flex !important;
+                justify-content:center !important;
+                align-items:center !important;
+                background:#1a1a1a !important;
+                border:1px solid #2d2d2d !important;
+                border-radius:10px !important;
+            }
+            .plugin-reload-btn button:hover {
+                background:#242424 !important;
+                border-color:#3a3a3a !important;
+            }
+            .plugin-reload-btn button::before {
+                content:"↻";
+                font-size:16px;
+                color:#f0f0f0;
+            }
 
             /* Chat body text (≈18px) */
             #center-col [data-testid="chatbot"] .prose {
@@ -1698,13 +1950,18 @@ def launch_app(args: argparse.Namespace) -> None:
                             ) -> Generator[Tuple[Any, Dict[str, Any]], None, None]:
                                 """Run a plugin by delegating to '.<plugin>' command, streaming results."""
                                 import gradio as gr
-                                try:
-                                    state_dict = state.value if hasattr(state, "value") else (state if isinstance(state, dict) else {})
-                                    hist = chat_history if isinstance(chat_history, list) else []
-                                    cmd = f".{name}"
-                                    append_to_chatbot(hist, cmd, metadata={"role": "user"})
-                                    yield gr.update(value=list(hist)), state_dict
+                                state_dict = (
+                                    state.value
+                                    if hasattr(state, "value")
+                                    else (state if isinstance(state, dict) else {})
+                                )
+                                hist = chat_history if isinstance(chat_history, list) else []
 
+                                cmd = f".{name}"
+                                append_to_chatbot(hist, cmd, metadata={"role": "user"})
+                                yield gr.update(value=list(hist)), state_dict
+
+                                try:
                                     first = True
                                     for item in process_input(cmd, state_dict, hist):
                                         if isinstance(item, list):
@@ -1723,19 +1980,54 @@ def launch_app(args: argparse.Namespace) -> None:
                                                 else:
                                                     append_to_chatbot(hist, chunk, metadata={"role": "assistant"})
                                         yield gr.update(value=list(hist)), state_dict
+                                except Exception as exc:
+                                    logger.error("[PLUGIN BTN] %s error: %s", name, exc)
+                                finally:
                                     yield gr.update(value=list(hist)), state_dict
-                                except Exception as e:
-                                    logger.error(f"[PLUGIN BTN] {name} error: {e}")
-                                    append_to_chatbot(chat_history, f"Plugin '{name}' error: {e}", metadata={"role": "assistant"})
-                                    yield gr.update(value=list(chat_history)), (state.value if hasattr(state, "value") else state or {})
-                            with gr.Row():
-                                for plugin_name in plugins.keys():
-                                    btn = gr.Button(value=plugin_name.capitalize())
-                                    btn.click(
-                                        fn=partial(plugin_handler_simple, plugin_name),
+
+                            def make_run_handler(plugin_key: str):
+                                def _handler(
+                                    chat_history: List[Dict[str, str]],
+                                    state: Dict[str, Any],
+                                ):
+                                    yield from plugin_handler_simple(plugin_key, chat_history, state)
+
+                                return _handler
+
+                            def make_reload_handler(plugin_key: str):
+                                def _handler():
+                                    success, message = reload_plugin(plugin_key)
+                                    if not success:
+                                        logger.error("%s", message)
+                                    return None
+
+                                return _handler
+
+                            for plugin_name in sorted(plugins.keys()):
+                                with gr.Row(elem_classes=["plugin-row"]):
+                                    run_btn = gr.Button(
+                                        plugin_name.capitalize(),
+                                        variant="primary",
+                                        scale=9,
+                                    )
+                                    reload_btn = gr.Button(
+                                        "",
+                                        variant="secondary",
+                                        elem_id=f"reload-btn-{plugin_name}",
+                                        elem_classes=["plugin-reload-btn"],
+                                        scale=1,
+                                    )
+                                    run_btn.click(
+                                        fn=make_run_handler(plugin_name),
                                         inputs=[chatbot, session_state],
                                         outputs=[chatbot, session_state],
                                         queue=True,
+                                    )
+                                    reload_btn.click(
+                                        fn=make_reload_handler(plugin_name),
+                                        inputs=[],
+                                        outputs=[],
+                                        queue=False,
                                     )
 
                     with gr.Accordion("Status", open=True):

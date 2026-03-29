@@ -1121,155 +1121,6 @@ def load_llm(mode: str, config: Dict) -> Tuple[str, Optional[LLM]]:
 
 def create_llm(mode: str, model_name: str) -> Optional[LLM]:
     """Create LLM instance based on mode and model name."""
-    if mode not in {"Local", "HuggingFace", "OpenAI", "OpenRouter"}:
-        raise ValueError("Invalid mode. Use: Local | HuggingFace | OpenAI | OpenRouter.")
-    if not isinstance(model_name, str) or not model_name.strip():
-        raise ValueError("Model name must be a non-empty string.")
-
-    clear_vram()
-    logger.debug(f"Creating LLM for mode: {mode}, model: {model_name}")
-
-    if mode == "Local":
-        from gptqmodel import GPTQModel, QuantizeConfig
-        state_manager.set_state("MODE", "Local")
-
-        pretrained = GPTQModel.load(
-            model_name,
-            quantize_config=QuantizeConfig(),
-            device_map=DEVICE_MAP,
-            use_safetensors=True,
-            trust_remote_code=True,
-        )
-
-        # Prefer GPU when available
-        try:
-            import torch as _torch
-            if _torch.cuda.is_available():
-                pretrained.model.to("cuda:0")
-                try:
-                    _torch.backends.cuda.matmul.allow_tf32 = True
-                    _torch.set_float32_matmul_precision("high")
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.debug(f"Could not place model on GPU explicitly: {e}")
-
-        # Cache and pad/eos sanity
-        try:
-            if hasattr(pretrained, "model") and hasattr(pretrained.model, "config"):
-                pretrained.model.config.use_cache = True
-            genconf = getattr(pretrained.model, "generation_config", None)
-            if genconf is not None:
-                setattr(genconf, "use_cache", True)
-        except Exception as e:
-            logger.debug(f"Could not enable use_cache on model: {e}")
-
-        try:
-            tok = pretrained.tokenizer
-            if (
-                getattr(tok, "pad_token_id", None) is None
-                and getattr(tok, "eos_token_id", None) is not None
-            ):
-                tok.pad_token_id = int(tok.eos_token_id)
-        except Exception as e:
-            logger.debug(f"Could not set pad_token_id on tokenizer: {e}")
-
-        # Dynamically derive EOS stop list (safe across models)
-        eos_ids = None
-        try:
-            eos_tok = getattr(pretrained.tokenizer, "eos_token_id", None)
-            if isinstance(eos_tok, int):
-                eos_ids = [int(eos_tok)]
-            elif isinstance(eos_tok, (list, tuple)) and eos_tok:
-                eos_ids = [int(x) for x in eos_tok if isinstance(x, int)]
-        except Exception as e:
-            logger.debug(f"Could not derive eos_token_id: {e}")
-
-        llm = HuggingFaceLLM(
-            model=pretrained.model,
-            tokenizer=pretrained.tokenizer,
-            context_window=int(CONTEXT_WINDOW),
-            max_new_tokens=int(MAX_NEW_TOKENS),
-            system_prompt="",
-            generate_kwargs={
-                "temperature": float(TEMPERATURE),
-                "top_p": float(TOP_P),
-                "top_k": int(TOP_K),
-                "repetition_penalty": float(REPETITION_PENALTY),
-                "no_repeat_ngram_size": int(NO_REPEAT_NGRAM_SIZE),
-                "do_sample": True,
-                "use_cache": True,
-                "pad_token_id": int(
-                    getattr(
-                        pretrained.tokenizer,
-                        "pad_token_id",
-                        getattr(pretrained.tokenizer, "eos_token_id", 0),
-                    )
-                ),
-            },
-            device_map=DEVICE_MAP,
-            is_chat_model=False,
-            stopping_ids=eos_ids,  # ensure early stop on EOS
-        )
-        state_manager.set_state("USE_CHAT", True)
-        logger.info("HF Local LLM ready (EOS stopping enabled).")
-        return llm
-
-    if mode == "HuggingFace":
-        state_manager.set_state("MODE", "Online")
-        llm = HuggingFaceInferenceAPI(
-            model_name=model_name,
-            api_key=__import__("os").getenv("HF_TOKEN"),
-            provider="auto",
-            is_chat_model=False,
-            num_output=int(MAX_NEW_TOKENS),
-            temperature=float(TEMPERATURE),
-            top_p=float(TOP_P),
-        )
-        token = __import__("os").getenv("HF_TOKEN")
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(model_name, token=token)
-            llm.__pydantic_private__["_tokenizer"] = tokenizer
-            logger.debug("Tokenizer attached to HuggingFaceInferenceAPI wrapper.")
-        except Exception as e:
-            logger.warning(f"Tokenizer load failed for {model_name}: {e}")
-        state_manager.set_state("USE_CHAT", False)
-        logger.info("HF Inference API LLM ready.")
-        return llm
-
-    if mode == "OpenAI":
-        state_manager.set_state("MODE", "Online")
-        llm = LlamaOpenAI(
-            model=model_name,
-            api_key=__import__("os").getenv("OPENAI_API_KEY"),
-            temperature=float(TEMPERATURE),
-            top_p=float(TOP_P),
-            max_tokens=int(MAX_NEW_TOKENS),
-            context_window=int(CONTEXT_WINDOW),
-        )
-        state_manager.set_state("USE_CHAT", True)
-        logger.info("OpenAI LLM ready.")
-        return llm
-
-    if mode == "OpenRouter":
-        state_manager.set_state("MODE", "Online")
-        llm = OpenRouter(
-            model=model_name,
-            api_key=__import__("os").getenv("OPENROUTER_API_KEY"),
-            temperature=float(TEMPERATURE),
-            top_p=float(TOP_P),
-            max_tokens=int(MAX_NEW_TOKENS),
-            context_window=int(CONTEXT_WINDOW),
-        )
-        state_manager.set_state("USE_CHAT", True)
-        logger.info("OpenRouter LLM ready.")
-        return llm
-
-    raise ValueError(f"Unhandled mode: {mode}")
-
-
-def create_llm(mode: str, model_name: str) -> Optional[LLM]:
-    """Create LLM instance based on mode and model name."""
     # Validate inputs
     if mode not in {"Local", "HuggingFace", "OpenAI", "OpenRouter"}:
         raise ValueError(
@@ -1325,6 +1176,16 @@ def create_llm(mode: str, model_name: str) -> Optional[LLM]:
         except Exception as e:
             logger.debug(f"Could not set pad_token_id on tokenizer: {e}")
 
+        eos_ids = None
+        try:
+            eos_tok = getattr(pretrained.tokenizer, "eos_token_id", None)
+            if isinstance(eos_tok, int):
+                eos_ids = [int(eos_tok)]
+            elif isinstance(eos_tok, (list, tuple)) and eos_tok:
+                eos_ids = [int(x) for x in eos_tok if isinstance(x, int)]
+        except Exception as e:
+            logger.debug(f"Could not derive eos_token_id: {e}")
+
         llm = HuggingFaceLLM(
             model=pretrained.model,
             tokenizer=pretrained.tokenizer,
@@ -1349,6 +1210,7 @@ def create_llm(mode: str, model_name: str) -> Optional[LLM]:
             },
             device_map=DEVICE_MAP,
             is_chat_model=False,
+            stopping_ids=eos_ids,
         )
         state_manager.set_state("USE_CHAT", True)
         logger.info("HF Local LLM ready (GPU placement enforced; KV cache enabled).")
@@ -1597,24 +1459,26 @@ def generate(
         if hasattr(llm, "max_new_tokens"):
             setattr(llm, "max_new_tokens", target)
 
-        # Provider-aware key for per-call budget (used where applicable)
         lower_name = type(llm).__name__.lower()
-        if "huggingfaceinferenceapi" in lower_name:
-            budget_key = "max_tokens"
-        elif any(s in lower_name for s in ("huggingface", "transformer", "hf")):
-            budget_key = "max_new_tokens"
-        else:
-            budget_key = "max_tokens"
-
         out_cap = int(target)
-        per_call_kwargs: dict[str, Any] = {}
-        if budget_key:
-            per_call_kwargs[budget_key] = out_cap
-        # Provide common aliases so providers honor the largest cap available.
-        per_call_kwargs.setdefault("max_tokens", out_cap)
-        per_call_kwargs.setdefault("max_new_tokens", out_cap)
-        per_call_kwargs.setdefault("max_output_tokens", out_cap)
-        per_call_kwargs.setdefault("max_completion_tokens", out_cap)
+        if "openrouter" in lower_name:
+            per_call_kwargs: dict[str, Any] = {"max_tokens": out_cap}
+            fallback_order = ["max_tokens"]
+        elif "openai" in lower_name:
+            per_call_kwargs = {
+                "max_tokens": out_cap,
+                "max_completion_tokens": out_cap,
+            }
+            fallback_order = ["max_completion_tokens", "max_tokens"]
+        elif "huggingfaceinferenceapi" in lower_name:
+            per_call_kwargs = {"max_tokens": out_cap}
+            fallback_order = ["max_tokens"]
+        elif any(s in lower_name for s in ("huggingface", "transformer", "hf")):
+            per_call_kwargs = {"max_new_tokens": out_cap}
+            fallback_order = ["max_new_tokens"]
+        else:
+            per_call_kwargs = {"max_tokens": out_cap}
+            fallback_order = ["max_tokens"]
 
         forward_kwargs = {
             k: v
@@ -1624,12 +1488,7 @@ def generate(
 
         def _invoke_with_budget(func: Callable[..., Any], *call_args: Any) -> Any:
             trial_kwargs = {**per_call_kwargs}
-            fallback_order = [
-                "max_completion_tokens",
-                "max_output_tokens",
-                "max_tokens",
-                "max_new_tokens",
-            ]
+            fallback_keys = list(fallback_order)
             while True:
                 try:
                     return func(*call_args, **trial_kwargs, **forward_kwargs)
@@ -1641,9 +1500,9 @@ def generate(
                             trial_kwargs.pop(key, None)
                             removed = True
                     if not removed:
-                        if not fallback_order:
+                        if not fallback_keys:
                             raise
-                        trial_kwargs.pop(fallback_order.pop(0), None)
+                        trial_kwargs.pop(fallback_keys.pop(0), None)
                     if not trial_kwargs:
                         return func(*call_args, **forward_kwargs)
 

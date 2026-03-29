@@ -15,6 +15,7 @@ DEFAULTS: Dict[str, Any] = {
     "REPETITION_PENALTY": 1.1,
     "NO_REPEAT_NGRAM_SIZE": 4,
     "DEBUG": True,
+    "OPEN_LOG_TERMINAL": False,
     "PLUGIN_IDLE_TIMEOUT_SECONDS": 0,
     "MODEL_PATH": "~/models/quantized",
     "EMBED_MODEL_PATH": "~/models/bge-large-en-v1.5",
@@ -163,6 +164,10 @@ CONFIG["MODEL_TYPE"] = model_defaults.get("model_type", None)
 
 # ----- GENERAL / PROMPTS -----
 CONFIG["DEBUG"] = config_dict.get("general", {}).get("debug", DEFAULTS["DEBUG"])
+CONFIG["OPEN_LOG_TERMINAL"] = config_dict.get("general", {}).get(
+    "open_log_terminal",
+    DEFAULTS["OPEN_LOG_TERMINAL"],
+)
 CONFIG["PLUGIN_IDLE_TIMEOUT_SECONDS"] = config_dict.get("general", {}).get(
     "plugin_idle_timeout_seconds",
     DEFAULTS["PLUGIN_IDLE_TIMEOUT_SECONDS"],

@@ -1,0 +1,4 @@
+interface:
+  display_name: "GIA Senior Dev"
+  short_description: "Senior development workflow for GIA"
+  default_prompt: "Use $gia-senior-dev to inspect, modify, or extend the GIA repo safely."

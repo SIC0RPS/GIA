@@ -365,6 +365,8 @@ except Exception as e:
 if os.path.exists(log_file):
     try:
         os.remove(log_file)
+    except FileNotFoundError:
+        pass
     except Exception as e:
         logger.error(f"Failed to remove old log file: {e}")
 
@@ -456,6 +458,7 @@ viewer_code = textwrap.dedent(
 )
 
 _launched = False
+_viewer_lock_path = os.path.join(tempfile.gettempdir(), "gia-debug-log-viewer.lock")
 
 
 def is_wsl() -> bool:
@@ -463,10 +466,66 @@ def is_wsl() -> bool:
     return "microsoft" in platform.uname().release.lower()
 
 
+def _pid_is_alive(pid: int) -> bool:
+    """Return True when a PID appears to still be running."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _acquire_viewer_lock() -> bool:
+    """Prevent multiple debug log viewers across separate GIA processes."""
+    try:
+        if os.path.exists(_viewer_lock_path):
+            try:
+                with open(_viewer_lock_path, "r", encoding="utf-8") as f:
+                    existing_pid = int((f.read() or "0").strip() or "0")
+                if _pid_is_alive(existing_pid):
+                    return False
+            except Exception:
+                pass
+        with open(_viewer_lock_path, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+    except OSError as exc:
+        logger.debug("Failed to create debug viewer lock: %s", exc)
+        return False
+    return True
+
+
+def _release_viewer_lock() -> None:
+    """Release the viewer lock only if it belongs to this process."""
+    try:
+        if not os.path.exists(_viewer_lock_path):
+            return
+        with open(_viewer_lock_path, "r", encoding="utf-8") as f:
+            owner_pid = int((f.read() or "0").strip() or "0")
+        if owner_pid == os.getpid():
+            os.unlink(_viewer_lock_path)
+    except Exception:
+        pass
+
+
+def _should_open_log_terminal() -> bool:
+    """Return True only when the external debug log viewer is explicitly enabled."""
+    env_value = os.environ.get("GIA_OPEN_LOG_TERMINAL")
+    if env_value is not None:
+        return env_value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(CONFIG.get("OPEN_LOG_TERMINAL", False))
+
+
 def open_log_terminal() -> None:
     """Open a secondary terminal to display logs from app.log."""
     global _launched
     if _launched:
+        return
+    if not _acquire_viewer_lock():
+        logger.debug("Debug log viewer already active; skipping secondary terminal launch.")
         return
     _launched = True
     system = platform.system()
@@ -501,7 +560,10 @@ def open_log_terminal() -> None:
             raise OSError(f"Unsupported OS: {system}")
 
         atexit.register(lambda: process.terminate() if process and process.poll() is None else None)
+        atexit.register(_release_viewer_lock)
     except Exception as e:
+        _launched = False
+        _release_viewer_lock()
         logger.error(f"Failed to open log terminal: {e}")
 
 
@@ -532,5 +594,5 @@ llama_logger.propagate = True
 if llama_logger.handlers:
     llama_logger.handlers.clear()
 
-if CONFIG["DEBUG"]:
+if CONFIG["DEBUG"] and _should_open_log_terminal():
     open_log_terminal()

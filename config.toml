@@ -14,6 +14,7 @@ no_repeat_ngram_size = 4
 
 [general]
 debug = true
+open_log_terminal = false
 
 [paths]
 model_path = "~/models/quantized"

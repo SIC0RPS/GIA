@@ -7,6 +7,7 @@
 ## Loading
 - Auto-loaded at startup by `gia.GIA.load_plugins()`.
 - Invoke from chat with `.name` or click the plugin button in the UI.
+- Reload on the fly with `.reload` or `.reload plugin_name` (CLI), or tap the reload icon beside each plugin in the Gradio UI.
 
 ## Function Signature
 ```python
@@ -89,7 +90,7 @@ def myplugin(
 - Optional helpers can live beside the entry file; they must not conflict with other plugin names.
 
 ## Loading & Running
-- Plugins load when GIA starts or when `.reload` (if implemented) runs.
+- Plugins load when GIA starts or when `.reload` runs (CLI) or when you tap a reload icon for a specific plugin in the Gradio UI.
 - Users trigger plugins via dot-commands (`.name optional-arg`).
 - The loader inspects signatures with `inspect.signature(...).bind_partial(state=..., chat_history=..., arg=...)` and raises clear errors on mismatch.
 

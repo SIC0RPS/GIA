@@ -119,6 +119,111 @@ $env:OPENROUTER_API_KEY="your_key_here"
 
 For persistent PowerShell setup, edit your profile file (`$PROFILE`).
 
+## CLI Usage
+
+GIA can now be used as an external model runner from any repo with simple CLI commands. The same entrypoint supports:
+
+- interactive CLI with no preloaded model
+- interactive CLI with a selected model already loaded
+- one-shot non-streaming prompts for scripts, agents, and pipelines
+
+Use the installed entrypoint:
+
+```bash
+gia --help
+```
+
+Or run it from source:
+
+```bash
+PYTHONPATH=src python -m gia --help
+```
+
+### Common Patterns
+
+Start the normal interactive CLI:
+
+```bash
+PYTHONPATH=src python -m gia --cli
+```
+
+Preload a model, then enter the interactive CLI:
+
+```bash
+PYTHONPATH=src python -m gia --cli --mode OpenRouter --model x-ai/grok-4-fast
+```
+
+Run one prompt and exit:
+
+```bash
+PYTHONPATH=src python -m gia \
+  --cli \
+  --mode OpenRouter \
+  --model x-ai/grok-4-fast \
+  --prompt "Summarize this repository"
+```
+
+Read the prompt from stdin:
+
+```bash
+cat prompt.txt | PYTHONPATH=src python -m gia \
+  --cli \
+  --mode OpenRouter \
+  --model x-ai/grok-4-fast \
+  --run
+```
+
+Use a local model directly:
+
+```bash
+PYTHONPATH=src python -m gia \
+  --cli \
+  --mode Local \
+  --model /absolute/path/to/model
+```
+
+### Supported CLI Flags
+
+- `--cli`: run without the Gradio UI
+- `--mode {Local,HuggingFace,OpenAI,OpenRouter}`: select the backend
+- `--model MODEL`: model name or local model path, depending on mode
+- `--prompt TEXT`: run one prompt and exit
+- `--run`: read one prompt from stdin and exit
+- `--system-prompt TEXT`: override the configured system prompt for one-shot runs
+- `--load-db`: load the configured database before the run
+- `--max-new-tokens N`: override the output token budget for one-shot runs
+- `--temperature FLOAT`: override temperature for one-shot runs
+- `--top-p FLOAT`: override nucleus sampling for one-shot runs
+- `--top-k N`: override top-k sampling for one-shot runs
+- `--repetition-penalty FLOAT`: override repetition penalty for one-shot runs
+- `--no-repeat-ngram-size N`: override no-repeat ngram size for one-shot runs
+- `--think`: enable `/think` control tags for compatible models such as CyberSic/Qwen-style local models
+- `--gen-arg KEY=VALUE`: pass extra kwargs directly through to `generate()`; repeat as needed
+
+### External Agent Example
+
+This is the intended pattern for agent workflows in other repositories:
+
+```bash
+PYTHONPATH=/home/scrps/project/GIA/src \
+  /home/scrps/miniconda3/envs/GIA_dev/bin/python -m gia \
+  --cli \
+  --mode OpenRouter \
+  --model x-ai/grok-4-fast \
+  --prompt "Review the current repo architecture and list the top three risks." \
+  --max-new-tokens 600 \
+  --temperature 0 \
+  --top-p 1
+```
+
+### CLI Notes
+
+- One-shot CLI mode reuses GIA's existing `generate()` path. It does not use a separate inference stack.
+- Interactive preload mode reuses the same shared `load_llm()` startup flow as the UI loader.
+- For CLI runs, external debug log viewer terminals are disabled so repeated agent calls do not spawn extra `wt.exe` windows.
+- API keys must still be provided through environment variables.
+- If you use `--run`, stdin must contain the full prompt text.
+
 ## How it Works
 
 GIA starts by loading your selected model (local or online), any RAG database, and plugins. You can interact via CLI or UI, with both interfaces staying synchronized.
